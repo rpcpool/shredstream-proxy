@@ -32,6 +32,7 @@ use tonic::Status;
 
 use crate::{forwarder::ShredMetrics, token_authenticator::BlockEngineConnectionError};
 mod deshred;
+pub mod io_uring;
 pub mod forwarder;
 mod heartbeat;
 mod server;

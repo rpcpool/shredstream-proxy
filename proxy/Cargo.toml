@@ -12,12 +12,15 @@ arc-swap = { workspace = true }
 bincode = { workspace = true }
 borsh = { workspace = true }
 clap = { workspace = true }
+core_affinity = { workspace = true }
 crossbeam-channel = { workspace = true }
 dashmap = { workspace = true }
 env_logger = { workspace = true }
 hostname = { workspace = true }
+io-uring = { workspace = true }
 itertools = { workspace = true }
 jito-protos = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
