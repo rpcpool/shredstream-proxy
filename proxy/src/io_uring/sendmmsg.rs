@@ -6,7 +6,6 @@ use std::{
     sync::{atomic::AtomicU64, Arc},
 };
 
-use ahash::HashMap;
 use core_affinity::CoreId;
 use crossbeam_channel::{Sender, TrySendError};
 use io_uring::{
@@ -21,6 +20,16 @@ struct RegisteredBuffer {
     index: u16,
     capacity: usize,
     buf: libc::iovec,
+}
+
+impl RegisteredBuffer {
+    unsafe fn unsafe_clone(&self) -> RegisteredBuffer {
+        RegisteredBuffer {
+            index: self.index,
+            capacity: self.capacity,
+            buf: self.buf.clone(),
+        }
+    }
 }
 
 unsafe impl Send for RegisteredBuffer {}
@@ -158,128 +167,31 @@ pub struct SendReq {
     rbuf: RegisteredBuffer,
 }
 
-pub enum LibcSocketAddr {
-    V4(libc::sockaddr_in),
-    V6(libc::sockaddr_in6),
-}
 
-impl LibcSocketAddr {
-    pub fn as_ptr(&self) -> *const libc::sockaddr {
-        match self {
-            LibcSocketAddr::V4(addr) => addr as *const _ as *const libc::sockaddr,
-            LibcSocketAddr::V6(addr) => addr as *const _ as *const libc::sockaddr,
-        }
-    }
-
-    pub fn socklen_t(&self) -> libc::socklen_t {
-        match self {
-            LibcSocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>() as _,
-            LibcSocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>() as _,
-        }
-    }
-}
-
-fn into_libc_socketaddr(addr: SocketAddr) -> LibcSocketAddr {
-    match addr {
-        SocketAddr::V4(addr) => {
-            let ip = addr.ip(); // in network byte order (big-endian)
-            let libc_addr = libc::sockaddr_in {
-                sin_family: libc::AF_INET as _,
-                // must be in network byte order (big-endian)
-                sin_port: addr.port(),
-                sin_addr: libc::in_addr {
-                    s_addr: ip.to_bits(),
-                },
-                sin_zero: [0; 8], // padding
-            };
-            log::trace!("into_libc_socketaddr: V4 addr: {:?}", libc_addr);
-            LibcSocketAddr::V4(libc_addr)
-        }
-        SocketAddr::V6(addr) => {
-            let ip = addr.ip();
-            let libc_addr = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as _,
-                sin6_port: addr.port(),
-                sin6_flowinfo: addr.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: ip.octets(),
-                },
-                sin6_scope_id: addr.scope_id(),
-            };
-            log::trace!("into_libc_socketaddr: V6 addr: {:?}", libc_addr);
-            LibcSocketAddr::V6(libc_addr)
-        }
-    }
-}
-
-struct UsedBuffer {
-    rbuf: RegisteredBuffer,
-    ref_counter: u16,
-}
-
+#[derive(Debug)]
 struct SendReqContext {
     dest: SockAddr,
     rbuf_index: u16,
 }
 
+struct RegisteredBufferRc {
+    rbuf: RegisteredBuffer,
+    rc: u16,
+}
+
 struct IoUringEvLoop {
     ring: IoUring,
     #[allow(dead_code)]
-    send_socket: socket2::Socket,
+    send_socket: UdpSocket,
     send_socket_fd: types::Fd,
     backpressured_submissions: VecDeque<Entry>,
     free_buffer_tx: crossbeam_channel::Sender<FreshSendPermit>,
     buffer_capacity: usize,
     send_req_rx: crossbeam_channel::Receiver<SendReqBatch>,
-    used_buffers: Vec<Option<UsedBuffer>>,
+    registered_buffers_refcount_vec: Vec<RegisteredBufferRc>,
     linger: usize,
     stats: Arc<SendStats>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SendZcUserData {
-    buf_index: u16,
-    retry_count: u8,
-}
-
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("Failed to decode SendZcUserData missing magic byte")]
-struct DecodeSendZcUserDataError;
-
-impl SendZcUserData {
-    const MAGIC_BYTE: u8 = 0x42; // Magic byte
-
-    pub fn new(buf_index: u16, retry_count: u8) -> Self {
-        SendZcUserData {
-            buf_index,
-            retry_count,
-        }
-    }
-
-    pub fn encode_to_u64(self) -> u64 {
-        // Put a magic byte x42 in the lower byte
-        let SendZcUserData {
-            buf_index,
-            retry_count,
-        } = self;
-        let mut data: u64 = 0;
-        data |= (Self::MAGIC_BYTE as u64) << 56; // byte 7
-        data |= (buf_index as u64) << 40; // byte 6-5
-        data |= (retry_count as u64) << 32; // byte 4
-        data
-    }
-
-    pub fn decode_from_u64(data: u64) -> Result<Self, DecodeSendZcUserDataError> {
-        if (data >> 56) as u8 != Self::MAGIC_BYTE {
-            return Err(DecodeSendZcUserDataError);
-        }
-        let buf_index = ((data >> 40) & 0xFFFF) as u16; // bytes 6-5
-        let retry_count = ((data >> 32) & 0xFF) as u8; // byte 4
-        Ok(SendZcUserData {
-            buf_index,
-            retry_count,
-        })
-    }
+    disconnected: bool,
 }
 
 #[derive(Debug, Default)]
@@ -290,6 +202,7 @@ struct SendStats {
     copied_send_count: AtomicU64,
     submit_count: AtomicU64,
     submit_wait_cumu_time_ms: AtomicU64,
+    inflight_send: AtomicU64,
 }
 
 impl IoUringEvLoop {
@@ -298,10 +211,6 @@ impl IoUringEvLoop {
             .batch
             .into_iter()
             .fold(0, |acc, req| acc + self.push_send_req(req))
-    }
-
-    fn try_reserve_send_ctx(&mut self, n: usize) -> Option<Vec<SendReqContext>> {
-        todo!()
     }
 
     fn push_send_req(&mut self, send_req: SendReq) -> usize {
@@ -347,6 +256,10 @@ impl IoUringEvLoop {
             match submission_result {
                 Ok(_) => {
                     // Successfully pushed the operation
+                    self.stats.inflight_send.fetch_add(
+                        1,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     total_submissions += 1;
                 }
                 Err(_e) => {
@@ -355,10 +268,8 @@ impl IoUringEvLoop {
                 }
             }
         }
-        self.used_buffers.push(Some(UsedBuffer {
-            rbuf,
-            ref_counter: rbuf_ref_counter as u16,
-        }));
+        let rbuf_idx = rbuf.index as usize;
+        self.registered_buffers_refcount_vec[rbuf_idx].rc += rbuf_ref_counter as u16;
         total_submissions
     }
 
@@ -389,25 +300,25 @@ impl IoUringEvLoop {
     }
 
     fn dec_used_buffer_ref_cnt(&mut self, buf_index: u16) {
-        if let Some(used_buf) = self.used_buffers.get_mut(buf_index as usize) {
-            if let Some(mut used_buf) = used_buf.take() {
-                // Decrease the reference counter
-                used_buf.ref_counter = used_buf
-                    .ref_counter
-                    .checked_sub(1)
-                    .expect("release_used_buffer");
-                if used_buf.ref_counter == 0 {
-                    // The channel capacity should be enough to hold all buffers
-                    // so we can safely send the buffer back to the free buffer channel
-                    let new_permit = FreshSendPermit {
-                        rbuf: Some(used_buf.rbuf),
-                        free_rbuf_tx: self.free_buffer_tx.clone(),
-                    };
-                    self.free_buffer_tx
-                        .try_send(new_permit)
-                        .expect("release_used_buffer");
-                }
-            }
+        let rbuf = &mut self.registered_buffers_refcount_vec[buf_index as usize];
+        // Decrease the reference counter
+        rbuf.rc = rbuf
+            .rc
+            .checked_sub(1)
+            .expect("release_used_buffer");
+        log::trace!("registered buf {} - {} refs", buf_index, rbuf.rc);
+        if rbuf.rc == 0 {
+            log::trace!("Releasing used buffer: {}", rbuf.rbuf.index);
+            // The channel capacity should be enough to hold all buffers
+            // so we can safely send the buffer back to the free buffer channel
+            let rbuf2 = unsafe { rbuf.rbuf.unsafe_clone() };
+            let new_permit = FreshSendPermit {
+                rbuf: Some(rbuf2),
+                free_rbuf_tx: self.free_buffer_tx.clone(),
+            };
+            self.free_buffer_tx
+                .try_send(new_permit)
+                .expect("release_used_buffer");
         }
     }
 
@@ -416,14 +327,12 @@ impl IoUringEvLoop {
             More {
                 byte_sent: u32,
                 ctx: *const SendReqContext,
-            },
-            Error {
-                errono: i32,
-                ctx: *const SendReqContext,
+                err: Option<std::io::Error>,
             },
             Completed {
                 ctx: Box<SendReqContext>,
                 zero_copy: bool,
+                err: Option<std::io::Error>,
             },
         }
 
@@ -432,36 +341,47 @@ impl IoUringEvLoop {
                 let res = cqe.result();
                 let user_data = cqe.user_data();
                 let ctx_ptr = user_data as *const SendReqContext;
-                log::trace!("user data: {:?}", user_data);
-                if res < 0 {
-                    CqeResult::Error {
-                        errono: res,
-                        ctx: ctx_ptr,
-                    }
-                } else if more(cqe.flags()) {
+                let err = if res < 0 {
+                    Some(std::io::Error::from_raw_os_error(-res))
+                } else {
+                    None
+                };
+                if more(cqe.flags()) {
                     CqeResult::More {
                         byte_sent: res as _,
                         ctx: ctx_ptr,
+                        err,
                     }
-                } else {
+                } else if notif(cqe.flags()) {
                     assert!(notif(cqe.flags()));
                     let boxed_ctx = unsafe { Box::from_raw(ctx_ptr as *mut SendReqContext) };
+                    log::trace!("SendZc completed with flags: {}, user_data: {:?}", cqe.flags(), boxed_ctx);
                     CqeResult::Completed {
                         ctx: boxed_ctx,
                         zero_copy: true,
+                        err,
                     }
+                } else {
+                    panic!("cqe.flags()")
                 }
             }
         }
 
-        loop {
-            let Some(cqe) = self.ring.completion().next() else {
-                break; // No more completions
-            };
-
-            let cqe: CqeResult = cqe.into();
+        let cqe_vec = {
+            let mut cq= self.ring.completion();
+            cq.sync();
+            // TODO: create a slab for this
+            let mut cqe_vec = Vec::with_capacity(cq.len());
+            for cqe in cq {
+                let cqe = cqe.into();
+                cqe_vec.push(cqe);
+            }
+            cqe_vec
+        };
+        
+        for cqe in cqe_vec {
             match cqe {
-                CqeResult::More { byte_sent, ctx: _ } => {
+                CqeResult::More { byte_sent, ctx: _, err } => {
                     log::trace!("SendZc more: {} bytes sent", byte_sent);
                     self.stats
                         .bytes_sent
@@ -469,15 +389,13 @@ impl IoUringEvLoop {
                     self.stats
                         .zc_send_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(e) = err {
+                        self.stats.errono_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        log::error!("SendZc failed with -errno: {e:?}");
+                    }
                 }
-                CqeResult::Error { errono, ctx } => {
-                    log::warn!("SendZc error: {}", errono);
-                    self.stats
-                        .errono_count
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // Handle error appropriately
-                }
-                CqeResult::Completed { ctx, zero_copy } => {
+                CqeResult::Completed { ctx, zero_copy , err } => {
                     self.dec_used_buffer_ref_cnt(ctx.rbuf_index);
                     if zero_copy {
                         log::trace!("SendZc completed with zero-copy");
@@ -485,9 +403,15 @@ impl IoUringEvLoop {
                             .zc_send_count
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     } else {
-                        log::trace!("SendZc completed without zero-copy");
+                        log::debug!("sendzc failed to used zero-copy");
                         self.stats
                             .copied_send_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+
+                    if let Some(e) = err {
+                        log::error!("SendZc failed with -errno: {e:?}");
+                        self.stats.errono_count
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
@@ -506,36 +430,46 @@ impl IoUringEvLoop {
             let send_req = match self.send_req_rx.try_recv() {
                 Ok(req) => req,
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => panic!("fill_submissions"),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.disconnected = true;
+                    return total_submissions;
+                },
             };
             total_submissions += self.push_send_req_batch(send_req);
         }
-        return total_submissions;
+        total_submissions
+    }
+
+    fn drain_process_cqe(&mut self) {
+        log::debug!("Draining completion queue");
+        while self.stats.inflight_send.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            self.process_completion_queue();
+        }
     }
 
     pub fn ev_loop(mut self) {
-        loop {
+        while !self.disconnected {
             self.process_completion_queue();
             let total_submission = self.fill_submissions();
             if total_submission > 0 {
-                log::trace!("Filled {} submissions", total_submission);
+                log::trace!("Filled {total_submission} submissions");
             }
-
             if self.ring.submission().len() >= self.linger {
-                let size = self.ring.submission().len();
                 let t = std::time::Instant::now();
-                self.ring.submit().expect("submit failed");
+                let submitted = self.ring.submit().expect("submit failed");
                 let elapsed = t.elapsed();
                 self.stats
                     .submit_count
-                    .fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(submitted as u64, std::sync::atomic::Ordering::Relaxed);
                 self.stats.submit_wait_cumu_time_ms.fetch_add(
                     elapsed.as_millis() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                log::trace!("Submitted {size} requests in {elapsed:?}");
+                log::trace!("Submitted {submitted} requests in {elapsed:?}");
             }
         }
+
+        self.drain_process_cqe();
     }
 }
 
@@ -705,12 +639,12 @@ impl ZcMulticastSender {
     }
 }
 
-pub fn zc_multicast_sender(send_socket: socket2::Socket) -> io::Result<ZcMulticastSender> {
+pub fn zc_multicast_sender(send_socket: UdpSocket) -> io::Result<ZcMulticastSender> {
     zc_multicast_sender_with_config(send_socket, ZcMulticastSenderConfig::default())
 }
 
 pub fn zc_multicast_sender_with_config(
-    send_socket: socket2::Socket,
+    send_socket: UdpSocket,
     config: ZcMulticastSenderConfig,
 ) -> io::Result<ZcMulticastSender> {
     let ZcMulticastSenderConfig {
@@ -758,9 +692,14 @@ pub fn zc_multicast_sender_with_config(
         "zc_multicast_sender_with_config: registered {} buffers of size {}",
         num_registered_buffers,
         registered_buffer_size
-    );
+    );  
 
+    let mut rbuf_rc_vec = vec![];
     for rbuf in rbuf_vec {
+        rbuf_rc_vec.push(RegisteredBufferRc {
+            rbuf: unsafe { rbuf.unsafe_clone() },
+            rc: 0,
+        });
         let permit = FreshSendPermit {
             rbuf: Some(rbuf),
             free_rbuf_tx: free_buffer_tx.clone(),
@@ -772,7 +711,6 @@ pub fn zc_multicast_sender_with_config(
 
     let send_socket_fd = types::Fd(send_socket.as_fd().as_raw_fd());
     let stats = Arc::new(SendStats::default());
-    let used_buffers = (0..num_registered_buffers).map(|_| None).collect();
     let ev_loop = IoUringEvLoop {
         ring,
         send_socket,
@@ -781,9 +719,10 @@ pub fn zc_multicast_sender_with_config(
         free_buffer_tx,
         buffer_capacity: registered_buffer_size,
         send_req_rx,
-        used_buffers,
+        registered_buffers_refcount_vec: rbuf_rc_vec,
         linger,
         stats: Arc::clone(&stats),
+        disconnected: false,
     };
 
     log::trace!(
@@ -803,9 +742,10 @@ pub fn zc_multicast_sender_with_config(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::{thread, time::Duration};
 
     use log::{LevelFilter, Metadata, Record, SetLoggerError};
+    use rand::{thread_rng, RngCore};
     use solana_net_utils::bind_to_localhost;
     use solana_streamer::{packet::Packet, recvmmsg::recv_mmsg};
 
@@ -826,7 +766,7 @@ mod tests {
 
         fn log(&self, record: &Record) {
             if self.enabled(record.metadata()) {
-                println!("{} - {}", record.level(), record.args());
+                println!("{} - line_no: {} - {}", record.level(), record.line().unwrap_or(0), record.args());
             }
         }
 
@@ -834,9 +774,8 @@ mod tests {
     }
 
     #[test]
-    pub fn test_multicast_msg() {
+    pub fn test_send_one_msg() {
         init().expect("Failed to initialize logger");
-        println!("starting");
         log::error!("Starting multicast message test");
         let reader = bind_to_localhost().expect("bind");
         let addr = reader.local_addr().unwrap();
@@ -849,10 +788,11 @@ mod tests {
 
         // let reader4 = bind_to_localhost().expect("bind");
         // let addr4 = reader4.local_addr().unwrap();
-        let sender_socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let socket_type = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC;
-        let sender_socket = socket2::Socket::new(libc::AF_INET.into(), socket_type.into(), None)
-            .expect("create sender socket");
+        // let sender_socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        // let socket_type = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC;
+        // let sender_socket = socket2::Socket::new(libc::AF_INET.into(), socket_type.into(), None)
+        //     .expect("create sender socket");
+        let sender_socket = bind_to_localhost().expect("bind");
         let mc_sender = zc_multicast_sender(sender_socket).expect("zc_multicast_sender");
         let packet = Packet::default();
         log::trace!("dest1: {:?}", addr);
@@ -865,16 +805,46 @@ mod tests {
         assert_eq!(1, recv);
 
         log::trace!("Received {} packets", recv);
-        // let mut packets = vec![Packet::default(); 32];
-        // let recv = recv_mmsg(&reader2, &mut packets[..]).unwrap();
-        // assert_eq!(1, recv);
+    }
 
-        // let mut packets = vec![Packet::default(); 32];
-        // let recv = recv_mmsg(&reader3, &mut packets[..]).unwrap();
-        // assert_eq!(1, recv);
+    #[test]
+    pub fn test_multicast() {
+        init().expect("Failed to initialize logger");
+        log::error!("Starting multicast message test");
+        let reader = bind_to_localhost().expect("bind");
+        let addr = reader.local_addr().unwrap();
 
-        // let mut packets = vec![Packet::default(); 32];
-        // let recv = recv_mmsg(&reader4, &mut packets[..]).unwrap();
-        // assert_eq!(1, recv);
+        let reader2 = bind_to_localhost().expect("bind");
+        let addr2 = reader2.local_addr().unwrap();
+
+        let reader3 = bind_to_localhost().expect("bind");
+        let addr3 = reader3.local_addr().unwrap();
+
+        let reader4 = bind_to_localhost().expect("bind");
+        let addr4 = reader4.local_addr().unwrap();
+
+        let sender_socket = bind_to_localhost().expect("bind");
+        let mc_sender = zc_multicast_sender(sender_socket).expect("zc_multicast_sender");
+        let mut expected_packet = vec![0u8; 1232];
+
+        let mut rng = thread_rng();
+        rng.fill_bytes(expected_packet.as_mut_slice());
+
+        log::trace!("dest1: {:?}", addr);
+        mc_sender
+            .send(&expected_packet, &[addr, addr2, addr3, addr4])
+            .expect("send multicast");
+
+
+        for rdr  in [reader, reader2, reader3, reader4].iter() {
+            let mut packets = vec![Packet::default(); 32];
+            let recv = recv_mmsg(rdr, &mut packets[..]).unwrap();
+            assert_eq!(1, recv);
+            let actual = packets[0].data(..).unwrap();
+            assert_eq!(actual.len(), expected_packet.len());
+            assert_eq!(*actual, expected_packet[..]);
+        }
+
+        thread::sleep(Duration::from_secs(1));
     }
 }
