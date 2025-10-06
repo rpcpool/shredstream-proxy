@@ -6,7 +6,7 @@ use std::{
         Arc, RwLock,
     },
     thread::{Builder, JoinHandle},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use arc_swap::ArcSwap;
@@ -242,10 +242,13 @@ fn recv_from_channel_and_send_multiple_dest(
 
     let mut packet_batch_vec = vec![packet_batch];
 
+    let t = Instant::now();
     let num_deduped = solana_perf::deduper::dedup_packets_and_count_discards(
         &deduper.read().unwrap(),
         &mut packet_batch_vec,
     );
+    let t_dedup = t.elapsed().as_micros() as u64;
+    metrics.dedup_time_spent.fetch_add(t_dedup, Ordering::Relaxed);
     // Store stats for each Packet
     packet_batch_vec.iter().for_each(|batch| {
         batch.iter().for_each(|packet| {
@@ -275,7 +278,16 @@ fn recv_from_channel_and_send_multiple_dest(
                 Some((data, addr))
             })
             .collect::<Vec<(&[u8], &SocketAddr)>>();
-
+        let t = Instant::now();
+        metrics
+            .send_batch_size_sum
+            .fetch_add(packets_with_dest.len() as u64, Ordering::Relaxed);
+        metrics.send_batch_count.fetch_add(1, Ordering::Relaxed);
+        const MAX_IOV: usize = libc::UIO_MAXIOV as usize;
+        let max_iov_count  = packets_with_dest.len() / MAX_IOV;
+        let unsaturated_iov_count = packets_with_dest.len() % MAX_IOV;
+        metrics.saturated_iov_count.fetch_add(max_iov_count as u64, Ordering::Relaxed);
+        metrics.unsaturated_iov_count.fetch_add(unsaturated_iov_count as u64, Ordering::Relaxed);
         match batch_send(send_socket, &packets_with_dest) {
             Ok(_) => {
                 metrics
@@ -297,6 +309,8 @@ fn recv_from_channel_and_send_multiple_dest(
                 );
             }
         }
+        let t_send = t.elapsed().as_micros() as u64;
+        metrics.batch_send_time_spent.fetch_add(t_send, Ordering::Relaxed);
     });
 
     // Count TraceShred shreds
@@ -463,6 +477,13 @@ pub struct ShredMetrics {
     pub duplicate: AtomicU64,
     /// (discarded, not discarded, from other shredstream instances)
     pub packets_received: DashMap<IpAddr, (u64, u64)>,
+    /// The batch size we are sending to batch_send solana crate call.
+    pub send_batch_size_sum: AtomicU64,
+    pub send_batch_count: AtomicU64,
+    /// Number of occurrences we can saturated the iovecs in sendmmsg
+    pub saturated_iov_count: AtomicU64,
+    /// Number of occurrences we could not saturate the iovecs in sendmmsg
+    pub unsaturated_iov_count: AtomicU64,
 
     // service metrics
     pub enabled_grpc_service: bool,
@@ -480,6 +501,10 @@ pub struct ShredMetrics {
     pub bincode_deserialize_error_count: AtomicU64,
     /// Number of times we couldn't find the previous DATA_COMPLETE_SHRED flag but tried to deshred+deserialize, and failed
     pub unknown_start_position_error_count: AtomicU64,
+
+    // cumulative time spent in deduping packets
+    pub dedup_time_spent: AtomicU64,
+    pub batch_send_time_spent: AtomicU64,
 
     // cumulative metrics (persist after reset)
     pub agg_received_cumulative: AtomicU64,
@@ -514,6 +539,12 @@ impl ShredMetrics {
             agg_success_forward_cumulative: Default::default(),
             agg_fail_forward_cumulative: Default::default(),
             duplicate_cumulative: Default::default(),
+            dedup_time_spent: Default::default(),
+            batch_send_time_spent: Default::default(),
+            send_batch_size_sum: Default::default(),
+            send_batch_count: Default::default(),
+            saturated_iov_count: Default::default(),
+            unsaturated_iov_count: Default::default(),
         }
     }
 
@@ -533,6 +564,41 @@ impl ShredMetrics {
             ),
             ("duplicate", self.duplicate.load(Ordering::Relaxed), i64),
         );
+
+        datapoint_info!(
+            "shredstream_proxy-sendmmsg_iov_metrics",
+            ("max_iov_count", self.saturated_iov_count.load(Ordering::Relaxed), i64),
+            (
+                "unsaturated_iov_count",
+                self.unsaturated_iov_count.load(Ordering::Relaxed),
+                i64
+            ),
+        );
+
+        datapoint_info!(
+            "shredstream_proxy-batch_send_metrics", 
+            (
+                "send_batch_size_sum", self.send_batch_size_sum.load(Ordering::Relaxed), i64
+            ),
+            (
+                "send_batch_count", self.send_batch_count.load(Ordering::Relaxed), i64
+            )
+        );
+
+        datapoint_info!(
+            "shredstream_proxy-time_allocation",
+            (
+                "deduping",
+                self.dedup_time_spent.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "batch_send",
+                self.batch_send_time_spent.load(Ordering::Relaxed),
+                i64
+            ),
+        );
+
 
         if self.enabled_grpc_service {
             datapoint_info!(
@@ -598,6 +664,12 @@ impl ShredMetrics {
         );
         self.duplicate_cumulative
             .fetch_add(self.duplicate.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+        self.dedup_time_spent.swap(0, Ordering::Relaxed);
+        self.batch_send_time_spent.swap(0, Ordering::Relaxed);
+        self.send_batch_size_sum.swap(0, Ordering::Relaxed);
+        self.send_batch_count.swap(0, Ordering::Relaxed);
+        self.saturated_iov_count.swap(0, Ordering::Relaxed);
+        self.unsaturated_iov_count.swap(0, Ordering::Relaxed);
     }
 }
 
