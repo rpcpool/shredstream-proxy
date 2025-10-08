@@ -34,9 +34,7 @@ use solana_streamer::{
 use tokio::sync::broadcast::Sender;
 
 use crate::{
-    deshred,
-    deshred::{ComparableShred, ShredsStateTracker},
-    resolve_hostname_port, ShredstreamProxyError,
+    deshred::{self, ComparableShred, ShredsStateTracker}, prom::{observe_batch_send_size, observe_batch_send_time, observe_dedup_time}, resolve_hostname_port, ShredstreamProxyError
 };
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
@@ -168,7 +166,11 @@ pub fn start_forwarder_threads(
                 .name(format!("ssPxyTx_{thread_id}"))
                 .spawn(move || {
                     if let Some(core_id) = send_core_id {
-                        core_affinity::set_for_current(core_id);
+                        if !core_affinity::set_for_current(core_id) {
+                            log::error!("Failed to set core affinity for ssPxyTx_{thread_id} to core {}", core_id.id);
+                        } else {
+                            log::info!("Pinned ssPxyTx_{thread_id} to core {}", core_id.id);
+                        }
                     }
                     let send_socket =
                         UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
@@ -257,8 +259,11 @@ fn recv_from_channel_and_send_multiple_dest(
         &deduper.read().unwrap(),
         &mut packet_batch_vec,
     );
-    let t_dedup = t.elapsed().as_micros() as u64;
-    metrics.dedup_time_spent.fetch_add(t_dedup, Ordering::Relaxed);
+    let t_dedup_usecs = t.elapsed().as_micros() as u64;
+    metrics.dedup_time_spent.fetch_add(t_dedup_usecs, Ordering::Relaxed);
+    
+    observe_dedup_time(t_dedup_usecs as f64);
+
     // Store stats for each Packet
     packet_batch_vec.iter().for_each(|batch| {
         batch.iter().for_each(|packet| {
@@ -298,6 +303,7 @@ fn recv_from_channel_and_send_multiple_dest(
         let unsaturated_iov_count = packets_with_dest.len() % MAX_IOV;
         metrics.saturated_iov_count.fetch_add(max_iov_count as u64, Ordering::Relaxed);
         metrics.unsaturated_iov_count.fetch_add(unsaturated_iov_count as u64, Ordering::Relaxed);
+        observe_batch_send_size(packets_with_dest.len() as f64);
         match batch_send(send_socket, &packets_with_dest) {
             Ok(_) => {
                 metrics
@@ -319,8 +325,9 @@ fn recv_from_channel_and_send_multiple_dest(
                 );
             }
         }
-        let t_send = t.elapsed().as_micros() as u64;
-        metrics.batch_send_time_spent.fetch_add(t_send, Ordering::Relaxed);
+        let t_send_usecs = t.elapsed().as_micros() as u64;
+        metrics.batch_send_time_spent.fetch_add(t_send_usecs, Ordering::Relaxed);
+        observe_batch_send_time(t_send_usecs as f64);
     });
 
     // Count TraceShred shreds
