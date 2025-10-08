@@ -10,6 +10,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
+use core_affinity::CoreId;
 use crossbeam_channel::{Receiver, RecvError};
 use dashmap::DashMap;
 use itertools::Itertools;
@@ -58,6 +59,7 @@ pub fn start_forwarder_threads(
     use_discovery_service: bool,
     forward_stats: Arc<StreamerReceiveStats>,
     metrics: Arc<ShredMetrics>,
+    send_affinity: Option<Vec<CoreId>>, /*Affinity mask to use for forwarder threads */
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
 ) -> Vec<JoinHandle<()>> {
@@ -131,12 +133,17 @@ pub fn start_forwarder_threads(
         thread_hdls.push(hdl);
     };
 
+    let send_affinity = send_affinity.unwrap_or_default();
+
     sockets
         .into_iter()
         .chain(maybe_multicast_socket.into_iter().flatten())
         .enumerate()
         .flat_map(|(thread_id, incoming_shred_socket)| {
             let (packet_sender, packet_receiver) = crossbeam_channel::unbounded();
+            let send_core_id = send_affinity
+                .get(thread_id % send_affinity.len())
+                .cloned();
             let listen_thread = streamer::receiver(
                 format!("ssListen{thread_id}"),
                 Arc::new(incoming_shred_socket),
@@ -160,6 +167,9 @@ pub fn start_forwarder_threads(
             let send_thread = Builder::new()
                 .name(format!("ssPxyTx_{thread_id}"))
                 .spawn(move || {
+                    if let Some(core_id) = send_core_id {
+                        core_affinity::set_for_current(core_id);
+                    }
                     let send_socket =
                         UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
                             .expect("to bind to udp port for forwarding");
