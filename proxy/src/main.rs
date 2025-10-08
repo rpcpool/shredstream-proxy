@@ -417,15 +417,21 @@ fn main() -> Result<(), ShredstreamProxyError> {
         thread_handles.push(server_hdl);
     }
 
+    if let Some(prom_bind_addr) = args.prometheus_bind_addr {
+        let prom_hdl = prom::spawn_prometheus_server(
+            prom_bind_addr, 
+            prom_registry, 
+            shutdown_receiver.clone()
+        );
+        thread_handles.push(prom_hdl);
+    }
+
     info!(
         "Shredstream started, listening on {}:{}/udp.",
         args.src_bind_addr, args.src_bind_port
     );
 
-    if let Some(prom_bind_addr) = args.prometheus_bind_addr {
-        let prom_hdl = prom::spawn_prometheus_server(prom_bind_addr, prom_registry);
-        thread_handles.push(prom_hdl);
-    }
+    
 
     for thread in thread_handles {
         thread.join().expect("thread panicked");

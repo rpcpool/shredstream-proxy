@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, thread::JoinHandle};
+use std::{net::SocketAddr, thread::JoinHandle, time::Duration};
 
 use prometheus::{Histogram, HistogramOpts, TextEncoder};
 use tiny_http::{Response, StatusCode};
@@ -49,29 +49,44 @@ pub fn register_metrics(registry: &prometheus::Registry) {
 pub fn spawn_prometheus_server(
     bind_addr: SocketAddr,
     registry: prometheus::Registry,
+    shutdown_signal: crossbeam_channel::Receiver<()>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("ssPxyPrometheusServer".to_string())
         .spawn(move || {
             let server = tiny_http::Server::http(bind_addr).unwrap();
             log::info!("Prometheus metrics server running on {}", bind_addr);
-            for request in server.incoming_requests() {
-                let gather = registry.gather();
-                let encoding_result = TextEncoder::new().encode_to_string(&gather);
-                match encoding_result {
-                    Ok(encoded) => {
-                        let response = Response::from_string(encoded)
-                            .with_status_code(StatusCode::from(200));
+            loop {
+                if shutdown_signal.try_recv().is_ok() {
+                    log::info!("Shutting down Prometheus metrics server");
+                    break;
+                }
+                // handle each request in a separate thread to avoid blocking
+                let result = server
+                    .recv_timeout(Duration::from_secs(1));
+                let maybe = match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        panic!("Error receiving request: {e}");
+                    }
+                };
+                if let Some(request) = maybe {
+                    let gather = registry.gather();
+                    let encoding_result = TextEncoder::new().encode_to_string(&gather);
+                    match encoding_result {
+                        Ok(encoded) => {
+                            let response = Response::from_string(encoded)
+                                .with_status_code(StatusCode::from(200));
 
-                        if let Err(e) = request.respond(response) {
-                            log::error!("Failed to respond to prometheus scrape request: {e}");
+                            if let Err(e) = request.respond(response) {
+                                log::error!("Failed to respond to prometheus scrape request: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            panic!("Failed to encode prometheus metrics: {e}");
                         }
                     }
-                    Err(e) => {
-                        panic!("Failed to encode prometheus metrics: {e}");
-                    }
                 }
-
             }
         })
         .unwrap()

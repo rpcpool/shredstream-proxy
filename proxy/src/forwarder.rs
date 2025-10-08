@@ -131,7 +131,7 @@ pub fn start_forwarder_threads(
         thread_hdls.push(hdl);
     };
 
-    let send_affinity = send_affinity.unwrap_or_default();
+    let send_affinity = send_affinity.as_ref();
 
     sockets
         .into_iter()
@@ -140,8 +140,13 @@ pub fn start_forwarder_threads(
         .flat_map(|(thread_id, incoming_shred_socket)| {
             let (packet_sender, packet_receiver) = crossbeam_channel::unbounded();
             let send_core_id = send_affinity
-                .get(thread_id % send_affinity.len())
-                .cloned();
+                .and_then(|send_affinity| {
+                    if send_affinity.is_empty() {
+                        None
+                    } else {
+                        Some(send_affinity[thread_id % send_affinity.len()])
+                    }
+                });
             let listen_thread = streamer::receiver(
                 format!("ssListen{thread_id}"),
                 Arc::new(incoming_shred_socket),
