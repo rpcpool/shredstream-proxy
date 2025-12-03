@@ -326,6 +326,8 @@ pub fn start_multicast_forwarder_thread(
                     match try_create_ipv6_socket(ipv6_addr) {
                         Ok(socket) => {
                             info!("Successfully bound send socket to IPv6 dual-stack address.");
+                            socket.set_multicast_loop_v6(false)
+                              .expect("Failed to disable IPv6 multicast loopback");
                             socket
                         }
                         Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
@@ -335,6 +337,8 @@ pub fn start_multicast_forwarder_thread(
                             let socket = UdpSocket::bind(ipv4_addr)
                                 .expect("Failed to bind to IPv4 socket after IPv6 failed");
                             socket.set_multicast_ttl_v4(IP_MULTICAST_TTL).expect("IP_MULTICAST_TTL_V4");
+                            socket.set_multicast_loop_v4(false)
+                                .expect("Failed to disable IPv4 multicast loopback");
                             socket
                         }
                         Err(e) => {
