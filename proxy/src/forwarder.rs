@@ -341,7 +341,8 @@ pub fn start_multicast_forwarder_thread(
                             socket
                         }
                         Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
-                            // This error (code 97 on Linux) means IPv6 is not supported.                          warn!("IPv6 not available. Falling back to IPv4-only for sending.");
+                            // This error (code 97 on Linux) means IPv6 is not supported.
+                            warn!("IPv6 not available. Falling back to IPv4-only for sending.");
                             let ipv4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
                             let socket = UdpSocket::bind(ipv4_addr)
                                 .expect("Failed to bind to IPv4 socket after IPv6 failed");
