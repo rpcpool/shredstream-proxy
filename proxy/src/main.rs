@@ -348,6 +348,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         args.src_bind_port,
         maybe_multicast_socket,
         maybe_triton_multicast_socket,
+        maybe_multicast_ifname,
         args.num_threads,
         deduper.clone(),
         args.grpc_service_port.is_some(),
