@@ -30,6 +30,7 @@ mod heartbeat;
 mod multicast_config;
 mod server;
 mod token_authenticator;
+mod prom;
 
 #[derive(Clone, Debug, Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -147,6 +148,10 @@ struct CommonArgs {
     triton_multicast_bind_interface: Option<String>,
     #[arg(long, env, default_value_t = 1)]
     triton_multicast_num_threads: usize,
+
+    /// Address to bind prometheus metrics server to. If not provided, prometheus server is disabled.
+    #[arg(long, env)]
+    prometheus_bind_addr: Option<SocketAddr>,
 }
 
 #[derive(Debug, Error)]
@@ -220,7 +225,8 @@ fn shutdown_notifier(exit: Arc<AtomicBool>) -> io::Result<(Sender<()>, Receiver<
 pub type ReconstructedShredsMap = HashMap<Slot, HashMap<u32 /* fec_set_index */, Vec<Shred>>>;
 fn main() -> Result<(), ShredstreamProxyError> {
     env_logger::builder().init();
-
+    let prom_registry  = prometheus::Registry::new();
+    prom::register_metrics(&prom_registry);
     let all_args: Args = Args::parse();
 
     let shredstream_args = all_args.shredstream_args.clone();
@@ -259,6 +265,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
     }
 
     let metrics = Arc::new(ShredMetrics::new(args.grpc_service_port.is_some()));
+    
 
     let runtime = Runtime::new()?;
     let mut thread_handles = vec![];
@@ -402,10 +409,21 @@ fn main() -> Result<(), ShredstreamProxyError> {
         thread_handles.push(server_hdl);
     }
 
+    if let Some(prom_bind_addr) = args.prometheus_bind_addr {
+        let prom_hdl = prom::spawn_prometheus_server(
+            prom_bind_addr, 
+            prom_registry, 
+            shutdown_receiver.clone()
+        );
+        thread_handles.push(prom_hdl);
+    }
+
     info!(
         "Shredstream started, listening on {}:{}/udp.",
         args.src_bind_addr, args.src_bind_port
     );
+
+    
 
     for thread in thread_handles {
         thread.join().expect("thread panicked");
