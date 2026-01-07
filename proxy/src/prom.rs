@@ -1,58 +1,107 @@
 use std::{net::SocketAddr, thread::JoinHandle, time::Duration};
 
-use prometheus::{Histogram, HistogramOpts, TextEncoder};
+use prometheus::{Counter, Histogram, HistogramOpts, IntCounterVec, Opts, TextEncoder};
 use tiny_http::{Response, StatusCode};
 
-
-
-
 lazy_static::lazy_static! {
-    // pub static ref REGISTRY: prometheus::Registry = prometheus::Registry::new();
-
-
-    static ref DEDUP_TIME_HIST: Histogram = Histogram::with_opts(
-        HistogramOpts::new("dedup_time_usec", "Histogram of time taken to deduplicate entries")
-            .buckets(vec![1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0, 144.0, 233.0, 377.0, 610.0])
-        
+    static ref DEDUP_DURATION_HIST: Histogram = Histogram::with_opts(
+        HistogramOpts::new("shredstream_dedup_duration_usec", "Time to deduplicate packets")
+            .buckets(vec![0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0])
     ).unwrap();
 
-    static ref BATCH_SEND_TIME_HIST: Histogram = Histogram::with_opts(
-        HistogramOpts::new("batch_send_time_usec", "Histogram of time taken to send a batch")
-            .buckets(vec![1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0, 144.0, 233.0, 377.0, 610.0])
-    ).unwrap();
-    
-    static ref BATCH_SEND_SIZE_HIST: Histogram = Histogram::with_opts(
-        HistogramOpts::new("batch_send_size", "Histogram of batch_send input size")
-            .buckets(vec![1.0, 5.0, 10.0, 20.0, 50.0, 70.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0, 900.0, 1000.0])
+    static ref SEND_DURATION_HIST: Histogram = Histogram::with_opts(
+        HistogramOpts::new("shredstream_send_duration_usec", "Time to send a batch of packets")
+            .buckets(vec![0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0])
     ).unwrap();
 
-    static ref RECV_TIME_HIST: Histogram = Histogram::with_opts(
-        HistogramOpts::new("recv_time_usec", "Histogram of time taken to receive a batch")
-            .buckets(vec![1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0, 144.0, 233.0, 377.0, 610.0])
+    static ref SEND_PACKET_COUNT_HIST: Histogram = Histogram::with_opts(
+        HistogramOpts::new("shredstream_send_packet_count", "Number of packets per batch send (after dedup)")
+            .buckets(vec![1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0])
     ).unwrap();
-    
+
+    static ref RECV_INTERVAL_HIST: Histogram = Histogram::with_opts(
+        HistogramOpts::new("shredstream_recv_interval_usec", "Time between receiving packet batches")
+            .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0])
+    ).unwrap();
+
+    static ref RECV_PACKET_COUNT_HIST: Histogram = Histogram::with_opts(
+        HistogramOpts::new("shredstream_recv_packet_count", "Number of packets in incoming batch (before dedup)")
+            .buckets(vec![1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0])
+    ).unwrap();
+
+    static ref PACKETS_RECEIVED_TOTAL: Counter = Counter::new(
+        "shredstream_packets_received_total", "Total packets received before dedup"
+    ).unwrap();
+
+    static ref PACKETS_DEDUPED_TOTAL: Counter = Counter::new(
+        "shredstream_packets_deduped_total", "Packets filtered by dedup"
+    ).unwrap();
+
+    static ref PACKETS_FORWARDED_TOTAL: Counter = Counter::new(
+        "shredstream_packets_forwarded_total", "Packets successfully forwarded"
+    ).unwrap();
+
+    static ref PACKETS_FORWARD_FAILED_TOTAL: Counter = Counter::new(
+        "shredstream_packets_forward_failed_total", "Packets that failed to forward"
+    ).unwrap();
+
+    static ref PACKETS_BY_SOURCE: IntCounterVec = IntCounterVec::new(
+        Opts::new("shredstream_packets_by_source", "Packets per source IP"),
+        &["addr", "status"]
+    ).unwrap();
 }
 
 pub fn observe_dedup_time(microseconds: f64) {
-    DEDUP_TIME_HIST.observe(microseconds);
-}
-pub fn observe_batch_send_size(size: f64) {
-    BATCH_SEND_SIZE_HIST.observe(size);
+    DEDUP_DURATION_HIST.observe(microseconds);
 }
 
-pub fn observe_batch_send_time(microseconds: f64) {
-    BATCH_SEND_TIME_HIST.observe(microseconds);
+pub fn observe_send_packet_count(count: f64) {
+    SEND_PACKET_COUNT_HIST.observe(count);
 }
 
-pub fn observe_recv_time(microseconds: f64) {
-    RECV_TIME_HIST.observe(microseconds);
+pub fn observe_send_duration(microseconds: f64) {
+    SEND_DURATION_HIST.observe(microseconds);
+}
+
+pub fn observe_recv_interval(microseconds: f64) {
+    RECV_INTERVAL_HIST.observe(microseconds);
+}
+
+pub fn observe_recv_packet_count(count: f64) {
+    RECV_PACKET_COUNT_HIST.observe(count);
+}
+
+pub fn inc_packets_received(count: u64) {
+    PACKETS_RECEIVED_TOTAL.inc_by(count as f64);
+}
+
+pub fn inc_packets_deduped(count: u64) {
+    PACKETS_DEDUPED_TOTAL.inc_by(count as f64);
+}
+
+pub fn inc_packets_forwarded(count: u64) {
+    PACKETS_FORWARDED_TOTAL.inc_by(count as f64);
+}
+
+pub fn inc_packets_forward_failed(count: u64) {
+    PACKETS_FORWARD_FAILED_TOTAL.inc_by(count as f64);
+}
+
+pub fn inc_packets_by_source(addr: &str, status: &str, count: u64) {
+    PACKETS_BY_SOURCE.with_label_values(&[addr, status]).inc_by(count);
 }
 
 pub fn register_metrics(registry: &prometheus::Registry) {
-    registry.register(Box::new(DEDUP_TIME_HIST.clone())).unwrap();
-    registry.register(Box::new(BATCH_SEND_SIZE_HIST.clone())).unwrap();
-    registry.register(Box::new(BATCH_SEND_TIME_HIST.clone())).unwrap();
-    registry.register(Box::new(RECV_TIME_HIST.clone())).unwrap();
+    registry.register(Box::new(DEDUP_DURATION_HIST.clone())).unwrap();
+    registry.register(Box::new(SEND_DURATION_HIST.clone())).unwrap();
+    registry.register(Box::new(SEND_PACKET_COUNT_HIST.clone())).unwrap();
+    registry.register(Box::new(RECV_INTERVAL_HIST.clone())).unwrap();
+    registry.register(Box::new(RECV_PACKET_COUNT_HIST.clone())).unwrap();
+    registry.register(Box::new(PACKETS_RECEIVED_TOTAL.clone())).unwrap();
+    registry.register(Box::new(PACKETS_DEDUPED_TOTAL.clone())).unwrap();
+    registry.register(Box::new(PACKETS_FORWARDED_TOTAL.clone())).unwrap();
+    registry.register(Box::new(PACKETS_FORWARD_FAILED_TOTAL.clone())).unwrap();
+    registry.register(Box::new(PACKETS_BY_SOURCE.clone())).unwrap();
 }
 
 

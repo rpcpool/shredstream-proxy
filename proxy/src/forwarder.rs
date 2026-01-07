@@ -35,7 +35,15 @@ use solana_streamer::{
 use tokio::sync::broadcast::Sender;
 
 use crate::{
-    ShredstreamProxyError, deshred::{self, ComparableShred, ShredsStateTracker}, prom::{observe_batch_send_size, observe_batch_send_time, observe_dedup_time, observe_recv_time}, resolve_hostname_port
+    ShredstreamProxyError,
+    deshred::{self, ComparableShred, ShredsStateTracker},
+    prom::{
+        observe_dedup_time, observe_send_packet_count, observe_send_duration,
+        observe_recv_interval, observe_recv_packet_count,
+        inc_packets_received, inc_packets_deduped, inc_packets_forwarded,
+        inc_packets_forward_failed, inc_packets_by_source,
+    },
+    resolve_hostname_port,
 };
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
@@ -201,7 +209,7 @@ pub fn start_forwarder_threads(
                             recv(packet_receiver) -> maybe_packet_batch => {
                                 let e = last_recv.elapsed();
                                 last_recv = Instant::now();
-                                observe_recv_time(e.as_micros() as f64);
+                                observe_recv_interval(e.as_micros() as f64);
                                 let res = recv_from_channel_and_send_multiple_dest(
                                     maybe_packet_batch,
                                     &deduper,
@@ -422,9 +430,12 @@ where
 {
     let packet_batch = maybe_packet_batch.map_err(ShredstreamProxyError::RecvError)?;
     let trace_shred_received_time = SystemTime::now();
+    let batch_len = packet_batch.len() as u64;
     metrics
         .received
-        .fetch_add(packet_batch.len() as u64, Ordering::Relaxed);
+        .fetch_add(batch_len, Ordering::Relaxed);
+    inc_packets_received(batch_len);
+    observe_recv_packet_count(batch_len as f64);
     debug!(
         "Got batch of {} packets, total size in bytes: {}",
         packet_batch.len(),
@@ -444,25 +455,26 @@ where
     );
     let t_dedup_usecs = t.elapsed().as_micros() as u64;
     metrics.dedup_time_spent.fetch_add(t_dedup_usecs, Ordering::Relaxed);
-    
     observe_dedup_time(t_dedup_usecs as f64);
+    inc_packets_deduped(num_deduped);
 
     // Store stats for each Packet
     packet_batch_vec.iter().for_each(|batch| {
         batch.iter().for_each(|packet| {
+            let addr = packet.meta().addr;
+            let is_discarded = packet.meta().discard();
             metrics
                 .packets_received
-                .entry(packet.meta().addr)
+                .entry(addr)
                 .and_modify(|(discarded, not_discarded)| {
-                    *discarded += packet.meta().discard() as u64;
-                    *not_discarded += (!packet.meta().discard()) as u64;
+                    *discarded += is_discarded as u64;
+                    *not_discarded += (!is_discarded) as u64;
                 })
                 .or_insert_with(|| {
-                    (
-                        packet.meta().discard() as u64,
-                        (!packet.meta().discard()) as u64,
-                    )
+                    (is_discarded as u64, (!is_discarded) as u64)
                 });
+            let status = if is_discarded { "discarded" } else { "forwarded" };
+            inc_packets_by_source(&addr.to_string(), status, 1);
         });
     });
 
@@ -494,13 +506,14 @@ where
         let unsaturated_iov_count = packets_with_dest.len() % MAX_IOV;
         metrics.saturated_iov_count.fetch_add(max_iov_count as u64, Ordering::Relaxed);
         metrics.unsaturated_iov_count.fetch_add(unsaturated_iov_count as u64, Ordering::Relaxed);
-        observe_batch_send_size(packets_with_dest.len() as f64);
+        observe_send_packet_count(packets_with_dest.len() as f64);
         match batch_send(send_socket, &packets_with_dest) {
             Ok(_) => {
                 metrics
                     .success_forward
                     .fetch_add(packets_with_dest.len() as u64, Ordering::Relaxed);
                 metrics.duplicate.fetch_add(num_deduped, Ordering::Relaxed);
+                inc_packets_forwarded(packets_with_dest.len() as u64);
             }
             Err(SendPktsError::IoError(err, num_failed)) => {
                 metrics
@@ -509,6 +522,7 @@ where
                 metrics
                     .duplicate
                     .fetch_add(num_failed as u64, Ordering::Relaxed);
+                inc_packets_forward_failed(packets_with_dest.len() as u64);
                 error!(
                     "Failed to send batch of size {} to {outgoing_socketaddr:?}. \
                      {num_failed} packets failed. Error: {err}",
@@ -518,7 +532,7 @@ where
         }
         let t_send_usecs = t.elapsed().as_micros() as u64;
         metrics.batch_send_time_spent.fetch_add(t_send_usecs, Ordering::Relaxed);
-        observe_batch_send_time(t_send_usecs as f64);
+        observe_send_duration(t_send_usecs as f64);
     });
 
     // Count TraceShred shreds
