@@ -46,6 +46,7 @@ tiny_http = "0.12.0"
 tokio = "1"
 tonic = { version = "0.13", features = ["tls-webpki-roots"] }
 tonic-build = "0.13"
+tikv-jemallocator = "0.6"
 
 [profile.release]
 # thin has minimal overhead vs none (default): https://blog.llvm.org/2016/06/thinlto-scalable-and-incremental-lto.html

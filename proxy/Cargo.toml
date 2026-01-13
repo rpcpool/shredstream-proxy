@@ -42,3 +42,6 @@ thiserror = { workspace = true }
 tiny_http = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }

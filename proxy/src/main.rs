@@ -32,6 +32,13 @@ mod server;
 mod token_authenticator;
 mod prom;
 
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 #[derive(Clone, Debug, Parser)]
 #[clap(author, version, about, long_about = None)]
 // https://docs.rs/clap/latest/clap/_derive/_cookbook/git_derive/index.html
