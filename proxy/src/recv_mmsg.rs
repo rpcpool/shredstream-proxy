@@ -1,65 +1,148 @@
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 use itertools::izip;
 use libc::{AF_INET, AF_INET6, MSG_WAITFORONE, iovec, mmsghdr, msghdr, sockaddr_storage};
 use socket2::socklen_t;
+use solana_ledger::shred::ShredId;
 use solana_perf::packet::{NUM_RCVMMSGS, PACKETS_PER_BATCH};
 use solana_sdk::packet::{Meta, PACKET_DATA_SIZE, Packet};
 use log::{error, trace};
 use solana_streamer::{recvmmsg::recv_mmsg, streamer::StreamerReceiveStats};
 use std::{
-    cmp, collections::VecDeque, io, mem::{self, MaybeUninit, zeroed}, net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket}, os::fd::AsRawFd, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant}
+    cmp, collections::VecDeque, hint::spin_loop, io, mem::{self, MaybeUninit, zeroed}, net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket}, os::fd::AsRawFd, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant}
 };
 
 use crate::mem::{FrameBuf, FrameBufMut, FrameDesc, Rx, SharedMem, Tx, try_alloc_shared_mem};
 
+
+const OFFSET_SHRED_TYPE: usize = 82;
+const OFFSET_DATA_PARENT: usize = 83; // 83 + 0
+const OFFSET_DATA_INDEX: usize = 83 - 15; // Index is actually in common header
+const OFFSET_CODING_POSITION: usize = 83 + 2;
+
+// Shred types based on Solana spec
+const SHRED_TYPE_DATA: u8 = 0b1010_0101;
+const SHRED_TYPE_CODING: u8 = 0b0101_1010;
 
 pub struct RecvMemConfig {
     pub frames_count: usize,
     pub hugepages: bool,
 }
 
+pub trait PacketRoutingStrategy: Clone {
+    fn route_packet(&self, packet: &TritonPacket, num_dest: usize) -> Option<usize>;
+}
 
-fn recv_loop(
+
+#[inline]
+fn hash_pair(x: u64, y: u32) -> u64 {
+    let mut h = x ^ ((y as u64) << 32);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h
+}
+
+#[derive(Debug, Clone)]
+struct FECSetRoutingStrategy;
+
+impl PacketRoutingStrategy for FECSetRoutingStrategy {
+    fn route_packet(&self, packet: &TritonPacket, num_dest: usize) -> Option<usize> {
+        let shred_buf = packet.buffer.chunk();
+        let slot = solana_ledger::shred::wire::get_slot(shred_buf)?;
+        let fec =  shred_buf.get(79..79 + 4)?;
+        let fec_bytes: [u8; 4] = fec.try_into().ok()?;
+        let fec_set_index = u32::from_le_bytes(fec_bytes);
+        let hash = hash_pair(slot, fec_set_index);
+        let dest = (hash as usize) % num_dest;
+        Some(dest)
+    }
+}
+
+
+
+pub fn recv_loop<R>(
     socket: &UdpSocket,
     exit: &AtomicBool,
     stats: &StreamerReceiveStats,
     coalesce: Duration,
-    mem_config: &RecvMemConfig,
     fill_rx: &mut Rx<FrameDesc>,
-    rx_tx: &Tx<FrameDesc>,
-) -> std::io::Result<()> {
+    packet_tx_vec: &[Tx<TritonPacket>],
+    router: R,
+) -> std::io::Result<()> 
+    where R: PacketRoutingStrategy
+{
     
     let mut packet_batch = Vec::with_capacity(PACKETS_PER_BATCH);
+    let mut frame_bufmut_vec = Vec::with_capacity(PACKETS_PER_BATCH);
+
+
     loop {
+
         // Check for exit signal, even if socket is busy
         // (for instance the leader transaction socket)
         if exit.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-
-        if let Ok(len) = recv_from(&mut packet_batch, socket, coalesce) {
+        // Refill the frame buffers as much as we can, 
+        'fill_bufmut: while frame_bufmut_vec.len() < PACKETS_PER_BATCH {
+            let maybe_frame_buf = fill_rx.try_recv();
+            match maybe_frame_buf {
+                Some(frame_desc) => {
+                    let frame_bufmut = frame_desc.as_mut_buf();
+                    frame_bufmut_vec.push(frame_bufmut);
+                }
+                None => {
+                    if frame_bufmut_vec.is_empty() {
+                        // block until we get at least one frame buffer
+                        let frame_desc = fill_rx.recv();
+                        let frame_bufmut = frame_desc.as_mut_buf();
+                        frame_bufmut_vec.push(frame_bufmut);
+                    } else {
+                        break 'fill_bufmut;
+                    }
+                }
+            }
+        }
+        let result = recv_from(
+            &mut frame_bufmut_vec,
+            socket,
+            coalesce,
+            &mut packet_batch,
+        );
+        if let Ok(len) = result {
             if len > 0 {
                 let StreamerReceiveStats {
                     packets_count,
                     packet_batches_count,
                     full_packet_batches_count,
-                    max_channel_len,
                     ..
                 } = stats;
 
                 packets_count.fetch_add(len, Ordering::Relaxed);
                 packet_batches_count.fetch_add(1, Ordering::Relaxed);
-                max_channel_len.fetch_max(packet_batch_sender.len(), Ordering::Relaxed);
                 if len == PACKETS_PER_BATCH {
                     full_packet_batches_count.fetch_add(1, Ordering::Relaxed);
                 }
                 packet_batch
                     .iter_mut()
-                    .for_each(|p| p.meta_mut().set_from_staked_node(is_staked_service));
-                packet_batch_sender.send(packet_batch)?;
+                    .for_each(|p| p.meta_mut().set_from_staked_node(false));
+
+                for packet in packet_batch.drain(..) {
+                    let dest_idx = match router.route_packet(&packet, packet_tx_vec.len()) {
+                        Some(idx) => idx,
+                        None => {
+                            log::debug!("Failed to route packet {:?}", packet);
+                            let trashed_frame_bufmut = packet.buffer.into_inner().as_mut_buf();
+                            frame_bufmut_vec.push(trashed_frame_bufmut);
+                            continue;
+                        }
+                    };
+                    let _ = &packet_tx_vec[dest_idx]
+                        .send(packet)
+                        .expect("Failed to send packet to processor");
+                }
             }
-            break;
         }
     }
 }
@@ -116,6 +199,8 @@ pub fn recv_from(
     Ok(i)
 }
 
+#[derive(Debug)]
+#[repr(C)]
 pub struct TritonPacket {
     pub buffer: FrameBuf,
     pub meta: Meta,
@@ -131,6 +216,12 @@ impl TritonPacket {
 
     pub fn meta_mut(&mut self) -> &mut Meta {
         &mut self.meta
+    }
+}
+
+impl AsRef<[u8]> for TritonPacket {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer.chunk()
     }
 }
 

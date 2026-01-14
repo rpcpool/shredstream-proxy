@@ -17,13 +17,12 @@ pub struct AllocError;
 
 #[repr(C)]
 pub struct SharedMem {
-    ptr: *mut u8,
-    aligned_size: usize,
-    capacity: usize,
+    pub ptr: *mut u8,
+    len: usize,
 }
 
 pub fn try_alloc_shared_mem(
-    align: usize,
+    num_items: usize,
     capacity: usize,
     huge: bool,
 ) -> Result<*mut u8, AllocError> {
@@ -32,11 +31,11 @@ pub fn try_alloc_shared_mem(
         capacity.is_power_of_two(),
         "capacity must be a power of two"
     );
-    let aligned_size = capacity * align;
+    let total_len = capacity * num_items;
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            aligned_size,
+            total_len,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED | libc::MAP_ANONYMOUS | if huge { libc::MAP_HUGETLB } else { 0 },
             -1,
@@ -50,7 +49,7 @@ pub fn try_alloc_shared_mem(
 
     // zero initialize the memory
     unsafe {
-        std::ptr::write_bytes(ptr as *mut u8, 0, aligned_size);
+        std::ptr::write_bytes(ptr as *mut u8, 0, total_len);
     }
 
     Ok(ptr as *mut u8)
@@ -59,27 +58,32 @@ pub fn try_alloc_shared_mem(
 
 
 impl SharedMem {
-    fn new(element_size: usize, capacity: usize, huge: bool) -> Result<Self, AllocError> {
+    pub fn new(element_size: usize, capacity: usize, huge: bool) -> Result<Self, AllocError> {
         let ptr = try_alloc_shared_mem(element_size, capacity, huge)?;
-        let aligned_size = capacity * element_size;
+        let len = capacity * element_size;
 
         Ok(Self {
             ptr,
-            aligned_size,
-            capacity,
+            len,
         })
     }
 
-    fn dealloc(&self) {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn dealloc(self) {
         unsafe {
-            libc::munmap(self.ptr as *mut libc::c_void, self.aligned_size);
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
         }
     }
 }
 
 impl Drop for SharedMem {
     fn drop(&mut self) {
-        self.dealloc();
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+        }
     }
 }
 
@@ -89,6 +93,8 @@ pub struct FrameDesc {
     pub ptr: *mut u8,
     pub frame_size: usize,
 }
+
+unsafe impl Send for FrameDesc {}
 
 #[derive(Debug)]
 #[repr(C, align(32))]
@@ -113,6 +119,47 @@ impl FrameBuf {
         let end = unsafe { self.desc.ptr.add(self.len) };
         (end as usize) - (self.curr_ptr as usize)
     }
+
+
+    #[inline]
+    pub fn into_inner(self) -> FrameDesc {
+        self.desc
+    }
+
+    #[inline]
+    pub unsafe fn detach_desc(&self) -> FrameDesc {
+        FrameDesc { ptr: self.desc.ptr, frame_size: self.desc.frame_size }
+    }
+
+    pub unsafe fn unsafe_clone(&self) -> Self {
+        Self {
+            curr_ptr: self.curr_ptr,
+            len: self.len,
+            desc: FrameDesc {
+                ptr: self.desc.ptr,
+                frame_size: self.desc.frame_size,
+            },
+        }
+    }
+
+    pub unsafe fn unsafe_subslice_clone(&self, offset: usize, len: usize) -> Self {
+        assert!(offset + len <= self.len());
+        Self {
+            curr_ptr: self.curr_ptr.add(offset),
+            len,
+            desc: FrameDesc {
+                ptr: self.desc.ptr,
+                frame_size: self.desc.frame_size,
+            },
+        }
+    }
+
+}
+
+impl AsRef<[u8]> for FrameBuf {
+    fn as_ref(&self) -> &[u8] {
+        self.chunk()
+    }
 }
 
 unsafe impl Send for FrameBuf {}
@@ -127,6 +174,7 @@ impl From<FrameBufMut> for FrameBuf {
         }
     }
 }
+
 
 impl FrameDesc {
     pub fn as_mut_buf(&self) -> FrameBufMut {

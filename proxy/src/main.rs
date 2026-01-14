@@ -33,7 +33,7 @@ mod token_authenticator;
 mod prom;
 mod recv_mmsg;
 mod mem;
-// mod triton_forwarder;
+mod triton_forwarder;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
