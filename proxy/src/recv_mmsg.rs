@@ -10,7 +10,7 @@ use std::{
     cmp, collections::VecDeque, io, mem::{self, MaybeUninit, zeroed}, net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket}, os::fd::AsRawFd, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant}
 };
 
-use crate::mem::{FrameBuffer, FrameDesc, PagedAlignedMem, Rx, Tx, try_alloc_shared_mem};
+use crate::mem::{FrameBuf, FrameBufMut, FrameDesc, Rx, SharedMem, Tx, try_alloc_shared_mem};
 
 
 pub struct RecvMemConfig {
@@ -25,9 +25,10 @@ fn recv_loop(
     stats: &StreamerReceiveStats,
     coalesce: Duration,
     mem_config: &RecvMemConfig,
+    fill_rx: &mut Rx<FrameDesc>,
+    rx_tx: &Tx<FrameDesc>,
 ) -> std::io::Result<()> {
     
-    let data_shmem = try_alloc_shared_mem(PACKET_DATA_SIZE.next_power_of_two(), mem_config.frames_count, mem_config.hugepages).expect("try_alloc_shared_mem");
     let mut packet_batch = Vec::with_capacity(PACKETS_PER_BATCH);
     loop {
         // Check for exit signal, even if socket is busy
@@ -66,8 +67,7 @@ fn recv_loop(
 
 
 pub fn recv_from(
-    fill_ring_rx: &mut Rx<FrameDesc>,
-    fill_ring_tx: &Tx<FrameDesc>,
+    available_frame_buf_vec: &mut Vec<FrameBufMut>,
     socket: &UdpSocket, 
     max_wait: Duration,
     batch: &mut Vec<TritonPacket>
@@ -85,53 +85,12 @@ pub fn recv_from(
 
     assert!(batch.capacity() >= PACKETS_PER_BATCH);
 
-    struct Defer<'a> {
-        i: usize,
-        allocated_frame: usize,
-        batch: &'a mut Vec<TritonPacket>,
-    };
-
-    impl Drop for Defer<'_> {
-        fn drop(&mut self) {
-            // Return unused frames to the fill ring
-            let exceeding_allocs = self.allocated_frame.saturating_sub(self.i);
-            (0..exceeding_allocs).for_each(|_| {
-                if let Some(unused_buffer) = self.batch.pop() {
-                    drop(unused_buffer);
-                }
-            });
-            self.allocated_frame = 0;
-        }
-    }
-
-    let mut defer = Defer {
-        i: 0,
-        allocated_frame: 0,
-        batch,
-    };
+    let mut i = 0;
 
     loop {
 
-        let frame_desc = fill_ring_rx.recv();
-        let buffer = FrameBuffer::new(frame_desc, fill_ring_tx.clone());
-        defer.allocated_frame += 1;
-        defer.batch[defer.i] = TritonPacket::new(buffer);
-
-        let mut j = defer.i + 1;
-        while j < PACKETS_PER_BATCH {
-
-            let Some(frame_desc) = fill_ring_rx.try_recv() else {
-                break;
-            };
-            let buffer = FrameBuffer::new(frame_desc, fill_ring_tx.clone());
-            defer.batch[j] = TritonPacket::new(buffer);
-            defer.allocated_frame += 1;
-            j += 1;
-
-        }
-
-        match triton_recv_mmsg(socket, &mut defer.batch[defer.i..j]) {
-            Err(_) if defer.i > 0 => {
+        match triton_recv_mmsg(socket, available_frame_buf_vec, &mut batch[i..]) {
+            Err(_) if i > 0 => {
                 if start.elapsed() > max_wait {
                     break;
                 }
@@ -141,30 +100,29 @@ pub fn recv_from(
                 return Err(e);
             }
             Ok(npkts) => {
-                if defer.i == 0 {
+                if i == 0 {
                     socket.set_nonblocking(true)?;
                 }
                 trace!("got {} packets", npkts);
-                defer.i += npkts;
+                i += npkts;
                 // Try to batch into big enough buffers
                 // will cause less re-shuffling later on.
-                if start.elapsed() > max_wait || defer.i >= PACKETS_PER_BATCH {
+                if start.elapsed() > max_wait || i >= PACKETS_PER_BATCH {
                     break;
                 }
             }
         }
     }
-
-    Ok(defer.i)
+    Ok(i)
 }
 
 pub struct TritonPacket {
-    pub buffer: FrameBuffer,
+    pub buffer: FrameBuf,
     pub meta: Meta,
 }
 
 impl TritonPacket {
-    pub fn new(buffer: FrameBuffer) -> Self {
+    pub fn new(buffer: FrameBuf) -> Self {
         Self {
             buffer,
             meta: Meta::default(),
@@ -177,7 +135,11 @@ impl TritonPacket {
 }
 
 
-pub fn triton_recv_mmsg(sock: &UdpSocket, packets: &mut [TritonPacket]) -> io::Result</*num packets:*/ usize> {
+pub fn triton_recv_mmsg(
+    sock: &UdpSocket, 
+    fill_buffers: &mut Vec<FrameBufMut>, 
+    packets: &mut [TritonPacket], 
+) -> io::Result</*num packets:*/ usize> {
     // Should never hit this, but bail if the caller didn't provide any Packets
     // to receive into
     if packets.is_empty() {
@@ -191,14 +153,23 @@ pub fn triton_recv_mmsg(sock: &UdpSocket, packets: &mut [TritonPacket]) -> io::R
     let mut hdrs = [MaybeUninit::uninit(); NUM_RCVMMSGS];
 
     let sock_fd = sock.as_raw_fd();
-    let count = cmp::min(iovs.len(), packets.len());
+    let count = cmp::min(iovs.len(), packets.len()).min(fill_buffers.len());
 
-    for (packet, hdr, iov, addr) in
-        izip!(packets.iter_mut(), &mut hdrs, &mut iovs, &mut addrs).take(count)
-    {
-        let buffer = packet.buffer.base();
+    let mut frame_buffer_inflight_vec: [MaybeUninit<FrameBufMut>; NUM_RCVMMSGS] =
+        std::array::from_fn(|_| MaybeUninit::uninit());
+
+    let mut frame_buffer_inflight_cnt = 0;
+    for (hdr, iov, addr) in
+        izip!(&mut hdrs, &mut iovs, &mut addrs).take(count)
+    {   
+        let buffer = fill_buffers.pop().expect("insufficient fill buffers");
+        assert!(buffer.remaining_mut() >= PACKET_DATA_SIZE, "fill buffer too small");
+        let iov_base = unsafe {
+            buffer.as_mut_ptr() as *mut libc::c_void
+        };
+
         iov.write(iovec {
-            iov_base: buffer as *mut libc::c_void,
+            iov_base: iov_base,
             iov_len: PACKET_DATA_SIZE,
         });
 
@@ -208,6 +179,9 @@ pub fn triton_recv_mmsg(sock: &UdpSocket, packets: &mut [TritonPacket]) -> io::R
             msg_len: 0,
             msg_hdr,
         });
+        // Keep track of the in-flight frame buffers to avoid use-after-free
+        frame_buffer_inflight_vec[frame_buffer_inflight_cnt].write(buffer);
+        frame_buffer_inflight_cnt += 1;
     }
 
     let mut ts = libc::timespec {
@@ -226,11 +200,16 @@ pub fn triton_recv_mmsg(sock: &UdpSocket, packets: &mut [TritonPacket]) -> io::R
         )
     };
     let nrecv = if nrecv < 0 {
+        // On error, return all in-flight frame buffers back to the caller
+        for i in 0..frame_buffer_inflight_cnt {
+            let buffer = unsafe { frame_buffer_inflight_vec[i].assume_init_read() };
+            fill_buffers.push(buffer);
+        }
         return Err(io::Error::last_os_error());
     } else {
         usize::try_from(nrecv).unwrap()
     };
-    for (addr, hdr, pkt) in izip!(addrs, hdrs, packets.iter_mut()).take(nrecv) {
+    for (addr, hdr, pkt, filled_bufmut) in izip!(addrs, hdrs, packets.iter_mut(), frame_buffer_inflight_vec).take(nrecv) {
         // SAFETY: We initialized `count` elements of `hdrs` above. `count` is
         // passed to recvmmsg() as the limit of messages that can be read. So,
         // `nrevc <= count` which means we initialized this `hdr` and
@@ -239,6 +218,9 @@ pub fn triton_recv_mmsg(sock: &UdpSocket, packets: &mut [TritonPacket]) -> io::R
         // SAFETY: Similar to above, we initialized this `addr` and recvmmsg()
         // will have populated it
         let addr_ref = unsafe { addr.assume_init_ref() };
+        let filled_bufmut = unsafe { filled_bufmut.assume_init_read() };
+        let filled_buf: FrameBuf = filled_bufmut.into();
+        pkt.buffer = filled_buf;
         pkt.meta_mut().size = hdr_ref.msg_len as usize;
         if let Some(addr) = cast_socket_addr(addr_ref, hdr_ref) {
             pkt.meta_mut().set_socket_addr(&addr);

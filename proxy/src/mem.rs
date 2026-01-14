@@ -175,6 +175,11 @@ impl FrameBufMut {
     fn end_ptr(&self) -> *const u8 {
         unsafe { self.base().add(self.capacity()) }
     }
+
+    #[inline]
+    pub unsafe fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
 }
 
 unsafe impl BufMut for FrameBufMut {
