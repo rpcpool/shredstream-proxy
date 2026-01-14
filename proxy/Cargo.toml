@@ -6,6 +6,15 @@ authors = { workspace = true }
 homepage = { workspace = true }
 edition = { workspace = true }
 
+[[bin]]
+name = "triton-proxy"
+path = "src/main2.rs"
+
+[[bin]]
+name = "jito-shredstream-proxy"
+path = "src/main.rs"
+
+
 [dependencies]
 ahash = { workspace = true }
 arc-swap = { workspace = true }

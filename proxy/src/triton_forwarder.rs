@@ -53,7 +53,7 @@ pub const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
 pub const IP_MULTICAST_TTL: u32 = 8;
 
 #[derive(Debug, Clone, Copy, Default)]
-pub enum ReceiverMemorySizing {
+pub enum PktRecvMemSizing {
     #[default]
     XSmall = 134217728, // 128MiB
     Small = 268435456,        // 256MiB
@@ -70,37 +70,37 @@ pub enum ReceiverMemorySizing {
 #[error("Invalid ReceiverMemoryCapacity: {0}")]
 pub struct ReceiverMemoryCapacityFromStrErr(String);
 
-impl FromStr for ReceiverMemorySizing {
+impl FromStr for PktRecvMemSizing {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "xsmall" | "xs" => Ok(ReceiverMemorySizing::XSmall),
-            "small" | "s" => Ok(ReceiverMemorySizing::Small),
-            "medium" | "m" => Ok(ReceiverMemorySizing::Medium),
-            "large" | "l" => Ok(ReceiverMemorySizing::Large),
-            "xlarge" | "xl" => Ok(ReceiverMemorySizing::XLarge),
-            "xxlarge" | "xxl" | "2xl" => Ok(ReceiverMemorySizing::XXLarge),
-            "xxxlarge" | "xxxl" | "3xl" => Ok(ReceiverMemorySizing::XXXLarge),
-            "xxxxlarge" | "xxxxl" | "4xl" => Ok(ReceiverMemorySizing::XXXXLarge),
-            "xxxxxlarge" | "xxxxxl" | "5xl" => Ok(ReceiverMemorySizing::XXXXXLarge),
+            "xsmall" | "xs" => Ok(PktRecvMemSizing::XSmall),
+            "small" | "s" => Ok(PktRecvMemSizing::Small),
+            "medium" | "m" => Ok(PktRecvMemSizing::Medium),
+            "large" | "l" => Ok(PktRecvMemSizing::Large),
+            "xlarge" | "xl" => Ok(PktRecvMemSizing::XLarge),
+            "xxlarge" | "xxl" | "2xl" => Ok(PktRecvMemSizing::XXLarge),
+            "xxxlarge" | "xxxl" | "3xl" => Ok(PktRecvMemSizing::XXXLarge),
+            "xxxxlarge" | "xxxxl" | "4xl" => Ok(PktRecvMemSizing::XXXXLarge),
+            "xxxxxlarge" | "xxxxxl" | "5xl" => Ok(PktRecvMemSizing::XXXXXLarge),
             _ => Err(s.to_string()),
         }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct PacketRecvTileMemConfig {
+pub struct PktRecvTileMemConfig {
     pub frame_size: usize,
-    pub memory_size: ReceiverMemorySizing,
+    pub memory_size: PktRecvMemSizing,
     pub hugepage: bool,
 }
 
-impl Default for PacketRecvTileMemConfig {
+impl Default for PktRecvTileMemConfig {
     fn default() -> Self {
         Self {
             frame_size: 2048,
-            memory_size: ReceiverMemorySizing::default(),
+            memory_size: PktRecvMemSizing::default(),
             hugepage: false,
         }
     }
@@ -219,7 +219,7 @@ fn packet_fwd_tile(
 
             let mut next_deduper_reset_attempt = Instant::now() + Duration::from_secs(2);
             let mut recycled_frames: Vec<FrameDesc> = Vec::with_capacity(UIO_MAXIOV);
-            while exit.load(Ordering::Relaxed) == false {
+            while !exit.load(Ordering::Relaxed) {
                 if next_deduper_reset_attempt.elapsed() > Duration::ZERO {
                     deduper.maybe_reset(
                         &mut rand::thread_rng(),
@@ -229,10 +229,27 @@ fn packet_fwd_tile(
                     next_deduper_reset_attempt = Instant::now() + Duration::from_secs(2);
                 }
 
+                if queued.is_empty() && recycled_frames.is_empty() && next_batch_send.is_empty() {
+                    if let Some(packet) = packet_rx.recv_timeout(Duration::from_millis(100)) {
+                        let data_size = packet.meta.size;
+                        let data_slice = &packet.buffer.chunk()[..data_size];
+                        if deduper.dedup(data_slice) {
+                            // put it inside the recycle queue
+                            debug!("Deduped packet from {}", packet.meta.addr);
+                            let desc = packet.buffer.into_inner();
+                            recycled_frames.push(desc);
+                        } else {
+                            queued.push_back(packet);
+                        }
+                    }
+                }
+
                 // Fill up the queued OR recycled_frames as much as possible
-                while queued.len() < UIO_MAXIOV && recycled_frames.len() < UIO_MAXIOV {
+                'fill_backlog: while queued.len() < UIO_MAXIOV && recycled_frames.len() < UIO_MAXIOV {
                     // Fill the batch as much as possible.
-                    let packet = packet_rx.recv();
+                    let Some(packet) = packet_rx.try_recv() else {
+                        break 'fill_backlog;
+                    };
                     let data_size = packet.meta.size;
                     let data_slice = &packet.buffer.chunk()[..data_size];
                     if deduper.dedup(data_slice) {
@@ -316,6 +333,7 @@ fn packet_fwd_tile(
                         .expect("frame recycling");
                 }
             }
+            log::info!("Exiting pkt_fwd_tile {}", packet_fwd_idx);
             drop(tile_drop_sig);
         })
 }
@@ -329,7 +347,7 @@ pub enum ProxySystemError {
 }
 
 pub fn run_proxy_system<R>(
-    pkt_recv_tile_mem_config: PacketRecvTileMemConfig,
+    pkt_recv_tile_mem_config: PktRecvTileMemConfig,
     dest_addr_vec: Arc<ArcSwap<Vec<SocketAddr>>>,
     src_ip: IpAddr,
     src_port: u16,
@@ -379,6 +397,13 @@ pub fn run_proxy_system<R>(
         );
         let shmem = SharedMem::new(frame_size, num_frames, pkt_recv_tile_mem_config.hugepage)
             .expect("SharedMem::new");
+        log::info!(
+            "Created shared memory region with frame_size={} num_frames={} total_size={} hugepage={}",
+            frame_size,
+            num_frames,
+            shmem.len(),
+            pkt_recv_tile_mem_config.hugepage,
+        );
 
         let shmem_info = SharedMemInfo {
             start_ptr: shmem.ptr,
@@ -400,6 +425,7 @@ pub fn run_proxy_system<R>(
         shmem_vec.push(shmem);
         fill_tx_vec.push(fill_tx);
         fill_rx_vec.push(fill_rx);
+        log::info!("Initialized frame ring with {} frames", num_frames);
     }
 
     // Create socket for sending packets
@@ -434,6 +460,10 @@ pub fn run_proxy_system<R>(
                 }
             }
         };
+        log::info!(
+            "Packet forwarder sending socket bound to {}",
+            send_socket.local_addr().unwrap()
+        );
         pkt_fwd_sk_vec.push(send_socket);
     }
 
@@ -444,6 +474,10 @@ pub fn run_proxy_system<R>(
         packet_tx_vec.push(packet_tx);
         packet_rx_vec.push(packet_rx);
     }
+    log::info!(
+        "Initialized pkt_fwd message rings with {} slots",
+        num_frames
+    );
 
     // Spawn pkt_fwd tiles
     for (pkt_fwd_idx, pkt_fwd_sk, packet_rx) in izip!(
@@ -467,6 +501,7 @@ pub fn run_proxy_system<R>(
         )
         .expect("packet_fwd_tile");
         tile_thread_vec.push(th);
+        log::info!("Spawned pkt_fwd tile {}", pkt_fwd_idx);
     }
 
     // Spawn pkt_recv tiles
@@ -479,7 +514,7 @@ pub fn run_proxy_system<R>(
         let forwarder_stats = Arc::clone(&stats);
         let packet_tx_vec_clone = packet_tx_vec.clone();
         let pkt_router_clone = pkt_router.clone();
-        packet_recv_tile(
+        let jh = packet_recv_tile(
             pkt_recv_idx,
             pkt_recv_sk,
             exit,
@@ -490,12 +525,17 @@ pub fn run_proxy_system<R>(
             tile_wait_group.get_tile_closed_signal(TileKind::PktRecv, pkt_recv_idx),
         )
         .expect("packet_recv_tile");
+        tile_thread_vec.push(jh);
+        log::info!("Spawned pkt_recv tile {}", pkt_recv_idx);
     }
 
     let (kind, idx) = tile_wait_group.wait_first();
     warn!("Tile of kind {kind:?} with idx {idx} has exited. Shutting down proxy system");
 
     exit.store(true, Ordering::Release);
+    drop(fill_tx_vec);
+    drop(packet_tx_vec);
+    log::info!("Waiting for {} tile threads to exit", tile_thread_vec.len());
     for th in tile_thread_vec {
         let result = th.join();
         if let Err(e) = result {

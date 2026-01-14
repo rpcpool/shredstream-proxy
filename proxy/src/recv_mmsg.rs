@@ -50,7 +50,7 @@ fn hash_pair(x: u64, y: u32) -> u64 {
 }
 
 #[derive(Debug, Clone)]
-struct FECSetRoutingStrategy;
+pub struct FECSetRoutingStrategy;
 
 impl PacketRoutingStrategy for FECSetRoutingStrategy {
     fn route_packet(&self, packet: &TritonPacket, num_dest: usize) -> Option<usize> {

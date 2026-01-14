@@ -1,12 +1,8 @@
 use std::{
-    cell::UnsafeCell,
     hint::spin_loop,
-    ops::{Index, IndexMut},
     sync::{
-        atomic::{AtomicI32, AtomicUsize, Ordering},
-        Arc,
-    },
-    thread::{self, Thread},
+        Arc, atomic::{AtomicI32, AtomicUsize, Ordering}
+    }, time::Duration,
 };
 
 use bytes::{buf::UninitSlice, Buf, BufMut};
@@ -418,23 +414,41 @@ impl<T> Tx<T> {
 
 impl<T> Rx<T> {
     pub fn recv(&mut self) -> T {
+        self.recv_timeout_inner(None).expect("recv failed")
+    }
+
+    pub fn recv_timeout(&mut self, duration: Duration) -> Option<T> {
+        self.recv_timeout_inner(Some(duration))
+    }
+
+    fn recv_timeout_inner(&mut self, duration: Option<Duration>) -> Option<T> {
         for _ in 0..999 {
             if let Some(val) = self.try_recv() {
-                return val;
+                return Some(val);
             }
             spin_loop();
         }
 
         loop {
             if let Some(val) = self.try_recv() {
-                return val;
+                return Some(val);
             }
 
             self.inner.futex_flag.store(0, Ordering::SeqCst);
 
             if let Some(val) = self.try_recv() {
-                return val;
+                return Some(val);
             }
+            
+            let timespec: Option<libc::timespec> = duration.map(|d| libc::timespec {
+                tv_sec: d.as_secs() as libc::time_t,
+                tv_nsec: d.subsec_nanos() as libc::c_long,
+            });
+
+            let timeout_ptr = match &timespec {
+                Some(ts) => ts as *const libc::timespec,
+                None => std::ptr::null(),
+            };
 
             unsafe {
                 libc::syscall(
@@ -442,8 +456,12 @@ impl<T> Rx<T> {
                     &self.inner.futex_flag as *const AtomicI32,
                     libc::FUTEX_WAIT,
                     0,
-                    std::ptr::null::<libc::timespec>(),
+                    timeout_ptr,
                 );
+            }
+
+            if duration.is_some(){
+                return self.try_recv();
             }
         }
     }
@@ -474,7 +492,7 @@ impl<T> Rx<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Barrier};
+    use std::{collections::HashSet, sync::Barrier, thread};
 
     use super::*;
 
