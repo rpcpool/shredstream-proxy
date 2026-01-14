@@ -9,7 +9,7 @@ use std::{
     thread::{self, Thread},
 };
 
-use bytes::{Buf, BufMut, buf::UninitSlice};
+use bytes::{buf::UninitSlice, Buf, BufMut};
 
 #[derive(Debug, thiserror::Error)]
 #[error("allocation error")]
@@ -55,17 +55,12 @@ pub fn try_alloc_shared_mem(
     Ok(ptr as *mut u8)
 }
 
-
-
 impl SharedMem {
     pub fn new(element_size: usize, capacity: usize, huge: bool) -> Result<Self, AllocError> {
         let ptr = try_alloc_shared_mem(element_size, capacity, huge)?;
         let len = capacity * element_size;
 
-        Ok(Self {
-            ptr,
-            len,
-        })
+        Ok(Self { ptr, len })
     }
 
     pub fn len(&self) -> usize {
@@ -120,7 +115,6 @@ impl FrameBuf {
         (end as usize) - (self.curr_ptr as usize)
     }
 
-
     #[inline]
     pub fn into_inner(self) -> FrameDesc {
         self.desc
@@ -128,7 +122,10 @@ impl FrameBuf {
 
     #[inline]
     pub unsafe fn detach_desc(&self) -> FrameDesc {
-        FrameDesc { ptr: self.desc.ptr, frame_size: self.desc.frame_size }
+        FrameDesc {
+            ptr: self.desc.ptr,
+            frame_size: self.desc.frame_size,
+        }
     }
 
     pub unsafe fn unsafe_clone(&self) -> Self {
@@ -153,7 +150,6 @@ impl FrameBuf {
             },
         }
     }
-
 }
 
 impl AsRef<[u8]> for FrameBuf {
@@ -175,7 +171,6 @@ impl From<FrameBufMut> for FrameBuf {
     }
 }
 
-
 impl FrameDesc {
     pub fn as_mut_buf(&self) -> FrameBufMut {
         FrameBufMut {
@@ -196,7 +191,6 @@ impl From<FrameDesc> for FrameBufMut {
         }
     }
 }
-
 
 impl FrameBufMut {
     #[inline]
@@ -265,10 +259,7 @@ impl Buf for FrameBuf {
     fn advance(&mut self, cnt: usize) {
         let new_ptr = unsafe { self.curr_ptr.add(cnt) };
         let end = unsafe { self.desc.ptr.add(self.len) };
-        assert!(
-            new_ptr as *const u8 <= end,
-            "advance out of bounds"
-        );
+        assert!(new_ptr as *const u8 <= end, "advance out of bounds");
         self.curr_ptr = new_ptr;
     }
 }

@@ -1,17 +1,23 @@
 use std::{
-    collections::{HashSet, VecDeque}, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket}, str::FromStr, sync::{
-        Arc, RwLock, atomic::{AtomicBool, AtomicU64, Ordering}
-    }, thread::{Builder, JoinHandle}, time::{Duration, Instant, SystemTime}
+    collections::{HashSet, VecDeque},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    str::FromStr,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+    thread::{Builder, JoinHandle},
+    time::{Duration, Instant, SystemTime},
 };
 
 use arc_swap::ArcSwap;
 use bytes::Buf;
-use crossbeam_channel::{Receiver, RecvError};
+use crossbeam_channel::{Receiver, RecvError, Sender};
 use dashmap::DashMap;
-use itertools::{Itertools, izip};
+use itertools::{izip, Itertools};
 use jito_protos::shredstream::{Entry as PbEntry, TraceShred};
-use log::{debug, error, info, warn};
 use libc;
+use log::{debug, error, info, warn};
 use prost::Message;
 use socket2::{Domain, Protocol, Socket, Type};
 use solana_client::client_error::reqwest;
@@ -22,16 +28,22 @@ use solana_perf::{
     packet::{PacketBatch, PacketBatchRecycler},
     recycler::Recycler,
 };
+use solana_sdk::exit;
 use solana_streamer::{
     sendmmsg::{batch_send, SendPktsError},
     streamer::{self, StreamerReceiveStats},
 };
-use tokio::sync::broadcast::Sender;
 
 use crate::{
-    ShredstreamProxyError, forwarder::{ShredMetrics, try_create_ipv6_socket}, mem::{FrameBuf, FrameDesc, Rx, SharedMem, Tx}, prom::{
-        inc_packets_by_source, inc_packets_deduped, inc_packets_forward_failed, inc_packets_forwarded, inc_packets_received, observe_dedup_time, observe_recv_interval, observe_recv_packet_count, observe_send_duration, observe_send_packet_count
-    }, recv_mmsg::{PacketRoutingStrategy, TritonPacket}, resolve_hostname_port
+    forwarder::{try_create_ipv6_socket, ShredMetrics},
+    mem::{FrameBuf, FrameDesc, Rx, SharedMem, Tx},
+    prom::{
+        inc_packets_by_source, inc_packets_deduped, inc_packets_forward_failed,
+        inc_packets_forwarded, inc_packets_received, observe_dedup_time, observe_recv_interval,
+        observe_recv_packet_count, observe_send_duration, observe_send_packet_count,
+    },
+    recv_mmsg::{PacketRoutingStrategy, TritonPacket},
+    resolve_hostname_port, ShredstreamProxyError,
 };
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
@@ -40,25 +52,23 @@ pub const DEDUPER_NUM_BITS: u64 = 637_534_199; // 76MB
 pub const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
 pub const IP_MULTICAST_TTL: u32 = 8;
 
-
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ReceiverMemorySizing {
     #[default]
     XSmall = 134217728, // 128MiB
-    Small = 268435456, // 256MiB
-    Medium = 536870912, // 512MiB
-    Large = 1073741824, // 1GiB
-    XLarge = 2147483648, // 2GiB
-    XXLarge = 4294967296, // 4GiB
-    XXXLarge = 8589934592, // 8GiB
-    XXXXLarge = 17179869184, // 16GiB
+    Small = 268435456,        // 256MiB
+    Medium = 536870912,       // 512MiB
+    Large = 1073741824,       // 1GiB
+    XLarge = 2147483648,      // 2GiB
+    XXLarge = 4294967296,     // 4GiB
+    XXXLarge = 8589934592,    // 8GiB
+    XXXXLarge = 17179869184,  // 16GiB
     XXXXXLarge = 34359738368, // 32GiB
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("Invalid ReceiverMemoryCapacity: {0}")]
 pub struct ReceiverMemoryCapacityFromStrErr(String);
-
 
 impl FromStr for ReceiverMemorySizing {
     type Err = String;
@@ -72,7 +82,7 @@ impl FromStr for ReceiverMemorySizing {
             "xlarge" | "xl" => Ok(ReceiverMemorySizing::XLarge),
             "xxlarge" | "xxl" | "2xl" => Ok(ReceiverMemorySizing::XXLarge),
             "xxxlarge" | "xxxl" | "3xl" => Ok(ReceiverMemorySizing::XXXLarge),
-            "xxxxlarge" | "xxxxl" | "4xl"  => Ok(ReceiverMemorySizing::XXXXLarge),
+            "xxxxlarge" | "xxxxl" | "4xl" => Ok(ReceiverMemorySizing::XXXXLarge),
             "xxxxxlarge" | "xxxxxl" | "5xl" => Ok(ReceiverMemorySizing::XXXXXLarge),
             _ => Err(s.to_string()),
         }
@@ -84,7 +94,6 @@ pub struct PacketRecvTileMemConfig {
     pub frame_size: usize,
     pub memory_size: ReceiverMemorySizing,
     pub hugepage: bool,
-
 }
 
 impl Default for PacketRecvTileMemConfig {
@@ -98,63 +107,33 @@ impl Default for PacketRecvTileMemConfig {
 }
 
 fn packet_recv_tile<R>(
-    sockets: Vec<UdpSocket>,
-    src_addr: IpAddr,
-    src_port: u16,
+    pkt_recv_idx: usize,
+    pkt_recv_socket: UdpSocket,
     exit: Arc<AtomicBool>,
     forwarder_stats: Arc<StreamerReceiveStats>,
-    fill_rx_vec: Vec<Rx<FrameDesc>>,
+    mut fill_rx: Rx<FrameDesc>,
     packet_tx_vec: Vec<Tx<TritonPacket>>,
     packet_router: R,
-    threads: &mut Vec<JoinHandle<()>>,
-) -> std::io::Result<()>
-    where R: PacketRoutingStrategy + Send + 'static,
-{ 
-    assert!(sockets.len() == fill_rx_vec.len(), "mismatched fill_rx_vec and sockets length");
-    assert!(sockets.len() == packet_tx_vec.len(), "mismatched packet_tx_vec and sockets length");
-
-    // let (_port, sockets) = solana_net_utils::multi_bind_in_range_with_config(
-    //     src_addr,
-    //     (src_port, src_port + 1),
-    //     SocketConfig::default().reuseport(true),
-    //     num_receiver,
-    // )
-    // .unwrap_or_else(|_| {
-    //     panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
-    // });
-
-    for (thread_id, socket, mut fill_rx) in izip!(0..sockets.len(), sockets.into_iter(), fill_rx_vec.into_iter()) {
-
-        // let shmem = SharedMem::new(
-        //     mem_config.frame_size,
-        //     mem_config.memory_size as usize / mem_config.frame_size,
-        //     mem_config.hugepage,
-        // ).expect("SharedMem::new");
-
-        let socket = Arc::new(socket);
-        let exit = Arc::clone(&exit);
-        let stats = Arc::clone(&forwarder_stats);
-        let packet_tx_vec = packet_tx_vec.clone();
-        let packet_router = R::clone(&packet_router);
-        let th = std::thread::Builder::new()
-            .name(format!("ssListen{thread_id}"))
-            .spawn(move || {
-                let socket = socket;
-                crate::recv_mmsg::recv_loop(
-                    &socket,
-                    &exit,
-                    &stats,
-                    Duration::default(),
-                    &mut fill_rx,
-                    &packet_tx_vec,
-                    packet_router,
-                )
-                .expect("recv_loop")
-            })?;
-
-        threads.push(th);
-    }
-    Ok(())
+    tile_drop_sig: TileClosedSignal,
+) -> std::io::Result<JoinHandle<()>>
+where
+    R: PacketRoutingStrategy + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(format!("ssListen{pkt_recv_idx}"))
+        .spawn(move || {
+            crate::recv_mmsg::recv_loop(
+                &pkt_recv_socket,
+                &exit,
+                &forwarder_stats,
+                Duration::default(),
+                &mut fill_rx,
+                &packet_tx_vec,
+                packet_router,
+            )
+            .expect("recv_loop");
+            drop(tile_drop_sig);
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +146,51 @@ pub struct SharedMemInfo {
 unsafe impl Send for SharedMemInfo {}
 unsafe impl Sync for SharedMemInfo {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TileKind {
+    PktRecv,
+    PktFwd,
+}
+
+struct TileClosedSignal {
+    kind: TileKind,
+    idx: usize,
+    tx: Option<Sender<(TileKind, usize)>>,
+}
+
+struct TileWaitGroup {
+    rx: Receiver<(TileKind, usize)>,
+    tx: Sender<(TileKind, usize)>,
+}
+
+impl TileWaitGroup {
+    fn new() -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        Self { rx, tx }
+    }
+
+    fn get_tile_closed_signal(&self, kind: TileKind, idx: usize) -> TileClosedSignal {
+        TileClosedSignal {
+            kind,
+            idx,
+            tx: Some(self.tx.clone()),
+        }
+    }
+
+    fn wait_first(self) -> (TileKind, usize) {
+        drop(self.tx);
+        self.rx.recv().expect("TileWaitGroup::wait_first")
+    }
+}
+
+impl Drop for TileClosedSignal {
+    fn drop(&mut self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send((self.kind, self.idx));
+        }
+    }
+}
+
 fn packet_fwd_tile(
     packet_fwd_idx: usize,
     hot_dest_vec: Arc<ArcSwap<Vec<SocketAddr>>>,
@@ -174,12 +198,12 @@ fn packet_fwd_tile(
     mut packet_rx: Rx<TritonPacket>,
     fill_tx_vec: Vec<Tx<FrameDesc>>,
     shmem_info_vec: Vec<SharedMemInfo>,
+    exit: Arc<AtomicBool>,
+    tile_drop_sig: TileClosedSignal,
 ) -> std::io::Result<JoinHandle<()>> {
-
     std::thread::Builder::new()
         .name(format!("ssPxyTx_{packet_fwd_idx}"))
         .spawn(move || {
-
             let mut deduper = Deduper::<2, [u8]>::new(&mut rand::thread_rng(), DEDUPER_NUM_BITS);
             const UIO_MAXIOV: usize = libc::UIO_MAXIOV as usize;
             // We allocate double size to account for possible overflow if destinations array is really big
@@ -187,15 +211,21 @@ fn packet_fwd_tile(
             let mut queued: VecDeque<TritonPacket> = VecDeque::with_capacity(UIO_MAXIOV);
 
             for shmem_info in &shmem_info_vec {
-                assert!(shmem_info.len.is_power_of_two(), "shmem_info.len must be a power of 2");
+                assert!(
+                    shmem_info.len.is_power_of_two(),
+                    "shmem_info.len must be a power of 2"
+                );
             }
 
             let mut next_deduper_reset_attempt = Instant::now() + Duration::from_secs(2);
             let mut recycled_frames: Vec<FrameDesc> = Vec::with_capacity(UIO_MAXIOV);
-            loop {
-
+            while exit.load(Ordering::Relaxed) == false {
                 if next_deduper_reset_attempt.elapsed() > Duration::ZERO {
-                    deduper.maybe_reset(&mut rand::thread_rng(), DEDUPER_FALSE_POSITIVE_RATE, DEDUPER_RESET_CYCLE);
+                    deduper.maybe_reset(
+                        &mut rand::thread_rng(),
+                        DEDUPER_FALSE_POSITIVE_RATE,
+                        DEDUPER_RESET_CYCLE,
+                    );
                     next_deduper_reset_attempt = Instant::now() + Duration::from_secs(2);
                 }
 
@@ -206,7 +236,6 @@ fn packet_fwd_tile(
                     let data_size = packet.meta.size;
                     let data_slice = &packet.buffer.chunk()[..data_size];
                     if deduper.dedup(data_slice) {
-
                         // put it inside the recycle queue
                         debug!("Deduped packet from {}", packet.meta.addr);
                         let desc = packet.buffer.into_inner();
@@ -214,15 +243,16 @@ fn packet_fwd_tile(
                     } else {
                         queued.push_back(packet);
                     }
-
                 }
 
                 let dests = hot_dest_vec.load();
                 let dests_len = dests.len();
 
                 // Fill up the next_batch_send
-                'fill_batch_send: while next_batch_send.len() < UIO_MAXIOV && queued.len() > 0 && dests_len > 0 {
-
+                'fill_batch_send: while next_batch_send.len() < UIO_MAXIOV
+                    && queued.len() > 0
+                    && dests_len > 0
+                {
                     let remaining = UIO_MAXIOV - next_batch_send.len();
                     if dests_len < remaining {
                         break 'fill_batch_send;
@@ -242,9 +272,21 @@ fn packet_fwd_tile(
                     }
                 }
 
-                assert!(next_batch_send.len() <= UIO_MAXIOV, "next_batch_send.len() = {}", next_batch_send.len());
-                assert!(recycled_frames.len() <= UIO_MAXIOV, "recycled_frames.len() = {}", recycled_frames.len());
-                assert!(queued.len() <= UIO_MAXIOV, "queued.len() = {}", queued.len());
+                assert!(
+                    next_batch_send.len() <= UIO_MAXIOV,
+                    "next_batch_send.len() = {}",
+                    next_batch_send.len()
+                );
+                assert!(
+                    recycled_frames.len() <= UIO_MAXIOV,
+                    "recycled_frames.len() = {}",
+                    recycled_frames.len()
+                );
+                assert!(
+                    queued.len() <= UIO_MAXIOV,
+                    "queued.len() = {}",
+                    queued.len()
+                );
 
                 match batch_send(&send_socket, &next_batch_send) {
                     Ok(_) => {
@@ -259,16 +301,22 @@ fn packet_fwd_tile(
                     }
                 }
 
-
                 // Recycle all used frames
                 while let Some(desc) = recycled_frames.pop() {
-                    let fill_ring_idx = shmem_info_vec.iter().find_position(|shmem_info| {
-                        (desc.ptr as usize) & (shmem_info.len - 1) == (shmem_info.start_ptr as usize)
-                    }).expect("unknown frame desc").0;
-                    fill_tx_vec[fill_ring_idx].send(desc).expect("frame recycling");
+                    let fill_ring_idx = shmem_info_vec
+                        .iter()
+                        .find_position(|shmem_info| {
+                            (desc.ptr as usize) & (shmem_info.len - 1)
+                                == (shmem_info.start_ptr as usize)
+                        })
+                        .expect("unknown frame desc")
+                        .0;
+                    fill_tx_vec[fill_ring_idx]
+                        .send(desc)
+                        .expect("frame recycling");
                 }
-
             }
+            drop(tile_drop_sig);
         })
 }
 
@@ -280,8 +328,7 @@ pub enum ProxySystemError {
     AllocError(crate::mem::AllocError),
 }
 
-
-pub fn spawn_proxy_system<R>(
+pub fn run_proxy_system<R>(
     pkt_recv_tile_mem_config: PacketRecvTileMemConfig,
     dest_addr_vec: Arc<ArcSwap<Vec<SocketAddr>>>,
     src_ip: IpAddr,
@@ -291,12 +338,12 @@ pub fn spawn_proxy_system<R>(
     pkt_router: R,
     exit: Arc<AtomicBool>,
     stats: Arc<StreamerReceiveStats>,
-) -> JoinHandle<()>
-    where R: PacketRoutingStrategy + Send + Sync + 'static,
+) where
+    R: PacketRoutingStrategy + Send + Sync + 'static,
 {
-
+    let mut tile_thread_vec: Vec<JoinHandle<()>> = Vec::new();
     // Build pkt_recv sockets
-    let (_port, sockets) = solana_net_utils::multi_bind_in_range_with_config(
+    let (_port, pkt_recv_sk_vec) = solana_net_utils::multi_bind_in_range_with_config(
         src_ip,
         (src_port, src_port + 1),
         SocketConfig::default().reuseport(true),
@@ -306,23 +353,32 @@ pub fn spawn_proxy_system<R>(
         panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
     });
 
+    let num_frames =
+        pkt_recv_tile_mem_config.memory_size as usize / pkt_recv_tile_mem_config.frame_size;
+    let frame_size = pkt_recv_tile_mem_config.frame_size;
 
-    // Create the shared memory regions for recv tiles
+    let tile_wait_group = TileWaitGroup::new();
     let mut shmem_info_vec: Vec<SharedMemInfo> = Vec::with_capacity(num_pkt_recv_tiles);
     let mut fill_tx_vec: Vec<Tx<FrameDesc>> = Vec::with_capacity(num_pkt_recv_tiles);
     let mut fill_rx_vec: Vec<Rx<FrameDesc>> = Vec::with_capacity(num_pkt_recv_tiles);
-    letm
     let mut shmem_vec: Vec<SharedMem> = Vec::with_capacity(num_pkt_recv_tiles);
+
+    let mut pkt_fwd_sk_vec: Vec<UdpSocket> = Vec::with_capacity(num_pkt_fwd_tiles);
+    let mut packet_rx_vec: Vec<Rx<TritonPacket>> = Vec::with_capacity(num_pkt_fwd_tiles);
+    let mut packet_tx_vec: Vec<Tx<TritonPacket>> = Vec::with_capacity(num_pkt_fwd_tiles);
+
+    // Create the shared memory regions for recv tiles
     for _ in 0..num_pkt_recv_tiles {
-        let frame_size = pkt_recv_tile_mem_config.frame_size;
-        let num_frames = pkt_recv_tile_mem_config.memory_size as usize / pkt_recv_tile_mem_config.frame_size;
-        assert!(num_frames.is_power_of_two(), "num_frames must be a power of 2");
-        assert!(frame_size.is_power_of_two(), "frame_size must be a power of 2");
-        let shmem = SharedMem::new(
-            frame_size,
-            num_frames,
-            pkt_recv_tile_mem_config.hugepage,
-        ).expect("SharedMem::new");
+        assert!(
+            num_frames.is_power_of_two(),
+            "num_frames must be a power of 2"
+        );
+        assert!(
+            frame_size.is_power_of_two(),
+            "frame_size must be a power of 2"
+        );
+        let shmem = SharedMem::new(frame_size, num_frames, pkt_recv_tile_mem_config.hugepage)
+            .expect("SharedMem::new");
 
         let shmem_info = SharedMemInfo {
             start_ptr: shmem.ptr,
@@ -337,51 +393,116 @@ pub fn spawn_proxy_system<R>(
                 ptr: unsafe { shmem.ptr.add(i * frame_size) },
                 frame_size: frame_size,
             };
-            fill_tx.send(frame_desc).expect("initial frame ring population");
+            fill_tx
+                .send(frame_desc)
+                .expect("initial frame ring population");
         }
         shmem_vec.push(shmem);
         fill_tx_vec.push(fill_tx);
         fill_rx_vec.push(fill_rx);
-    } 
+    }
 
     // Create socket for sending packets
+    for _ in 0..num_pkt_fwd_tiles {
+        let send_socket = {
+            let ipv6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+            match try_create_ipv6_socket(ipv6_addr) {
+                Ok(socket) => {
+                    info!("Successfully bound send socket to IPv6 dual-stack address.");
+                    socket
+                        .set_multicast_loop_v6(false)
+                        .expect("Failed to disable IPv6 multicast loopback");
+                    socket
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+                    // This error (code 97 on Linux) means IPv6 is not supported.
+                    warn!("IPv6 not available. Falling back to IPv4-only for sending.");
+                    let ipv4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                    let socket = UdpSocket::bind(ipv4_addr)
+                        .expect("Failed to bind to IPv4 socket after IPv6 failed");
+                    socket
+                        .set_multicast_ttl_v4(IP_MULTICAST_TTL)
+                        .expect("IP_MULTICAST_TTL_V4");
+                    socket
+                        .set_multicast_loop_v4(false)
+                        .expect("Failed to disable IPv4 multicast loopback");
+                    socket
+                }
+                Err(e) => {
+                    // For any other error (e.g., port in use), panic.
+                    panic!("Failed to bind send socket with an unexpected error: {e}");
+                }
+            }
+        };
+        pkt_fwd_sk_vec.push(send_socket);
+    }
 
+    // Create pkt_fwd message rings
+    // One ring per pkt_fwd tile
+    for _ in 0..num_pkt_fwd_tiles {
+        let (packet_tx, packet_rx) = crate::mem::message_ring(num_frames).expect("pkt_fwd ring");
+        packet_tx_vec.push(packet_tx);
+        packet_rx_vec.push(packet_rx);
+    }
 
-    let send_socket = {
-        let ipv6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-        match try_create_ipv6_socket(ipv6_addr) {
-            Ok(socket) => {
-                info!("Successfully bound send socket to IPv6 dual-stack address.");
-                socket.set_multicast_loop_v6(false)
-                    .expect("Failed to disable IPv6 multicast loopback");
-                socket
-            }
-            Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
-                // This error (code 97 on Linux) means IPv6 is not supported.
-                warn!("IPv6 not available. Falling back to IPv4-only for sending.");
-                let ipv4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-                let socket = UdpSocket::bind(ipv4_addr)
-                    .expect("Failed to bind to IPv4 socket after IPv6 failed");
-                socket.set_multicast_ttl_v4(IP_MULTICAST_TTL).expect("IP_MULTICAST_TTL_V4");
-                socket.set_multicast_loop_v4(false)
-                    .expect("Failed to disable IPv4 multicast loopback");
-                socket
-            }
-            Err(e) => {
-                // For any other error (e.g., port in use), panic.
-                panic!("Failed to bind send socket with an unexpected error: {e}");
-            }
+    // Spawn pkt_fwd tiles
+    for (pkt_fwd_idx, pkt_fwd_sk, packet_rx) in izip!(
+        0..num_pkt_fwd_tiles,
+        pkt_fwd_sk_vec.into_iter(),
+        packet_rx_vec.into_iter()
+    ) {
+        let hot_dest_vec = Arc::clone(&dest_addr_vec);
+        let fill_tx_vec = fill_tx_vec.clone();
+        let shmem_info_vec = shmem_info_vec.clone();
+        let exit = Arc::clone(&exit);
+        let th = packet_fwd_tile(
+            pkt_fwd_idx,
+            hot_dest_vec,
+            pkt_fwd_sk,
+            packet_rx,
+            fill_tx_vec,
+            shmem_info_vec,
+            exit,
+            tile_wait_group.get_tile_closed_signal(TileKind::PktFwd, pkt_fwd_idx),
+        )
+        .expect("packet_fwd_tile");
+        tile_thread_vec.push(th);
+    }
+
+    // Spawn pkt_recv tiles
+    for (pkt_recv_idx, pkt_recv_sk, fill_rx) in izip!(
+        0..num_pkt_recv_tiles,
+        pkt_recv_sk_vec.into_iter(),
+        fill_rx_vec.into_iter()
+    ) {
+        let exit = Arc::clone(&exit);
+        let forwarder_stats = Arc::clone(&stats);
+        let packet_tx_vec_clone = packet_tx_vec.clone();
+        let pkt_router_clone = pkt_router.clone();
+        packet_recv_tile(
+            pkt_recv_idx,
+            pkt_recv_sk,
+            exit,
+            forwarder_stats,
+            fill_rx,
+            packet_tx_vec_clone,
+            pkt_router_clone,
+            tile_wait_group.get_tile_closed_signal(TileKind::PktRecv, pkt_recv_idx),
+        )
+        .expect("packet_recv_tile");
+    }
+
+    let (kind, idx) = tile_wait_group.wait_first();
+    warn!("Tile of kind {kind:?} with idx {idx} has exited. Shutting down proxy system");
+
+    exit.store(true, Ordering::Release);
+    for th in tile_thread_vec {
+        let result = th.join();
+        if let Err(e) = result {
+            error!("Tile thread join error: {:?}", e);
         }
-    };
-
-
-    
-
-
-    todo!()
+    }
 }
-
-
 
 // #[cfg(test)]
 // mod tests {
@@ -399,7 +520,6 @@ pub fn spawn_proxy_system<R>(
 //         packet::{Meta, Packet, PacketBatch},
 //     };
 //     use solana_sdk::packet::{PacketFlags, PACKET_DATA_SIZE};
-
 
 //     fn listen_and_collect(listen_socket: UdpSocket, received_packets: Arc<Mutex<Vec<Vec<u8>>>>) {
 //         let mut buf = [0u8; PACKET_DATA_SIZE];

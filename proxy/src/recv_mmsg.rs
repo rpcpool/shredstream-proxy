@@ -1,18 +1,26 @@
+use std::{
+    cmp,
+    collections::VecDeque,
+    hint::spin_loop,
+    io,
+    mem::{self, zeroed, MaybeUninit},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
+    os::fd::AsRawFd,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
+
 use bytes::{Buf, BufMut};
 use itertools::izip;
-use libc::{AF_INET, AF_INET6, MSG_WAITFORONE, iovec, mmsghdr, msghdr, sockaddr_storage};
+use libc::{iovec, mmsghdr, msghdr, sockaddr_storage, AF_INET, AF_INET6, MSG_WAITFORONE};
+use log::{error, trace};
 use socket2::socklen_t;
 use solana_ledger::shred::ShredId;
 use solana_perf::packet::{NUM_RCVMMSGS, PACKETS_PER_BATCH};
-use solana_sdk::packet::{Meta, PACKET_DATA_SIZE, Packet};
-use log::{error, trace};
+use solana_sdk::packet::{Meta, Packet, PACKET_DATA_SIZE};
 use solana_streamer::{recvmmsg::recv_mmsg, streamer::StreamerReceiveStats};
-use std::{
-    cmp, collections::VecDeque, hint::spin_loop, io, mem::{self, MaybeUninit, zeroed}, net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket}, os::fd::AsRawFd, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant}
-};
 
-use crate::mem::{FrameBuf, FrameBufMut, FrameDesc, Rx, SharedMem, Tx, try_alloc_shared_mem};
-
+use crate::mem::{try_alloc_shared_mem, FrameBuf, FrameBufMut, FrameDesc, Rx, SharedMem, Tx};
 
 const OFFSET_SHRED_TYPE: usize = 82;
 const OFFSET_DATA_PARENT: usize = 83; // 83 + 0
@@ -32,7 +40,6 @@ pub trait PacketRoutingStrategy: Clone {
     fn route_packet(&self, packet: &TritonPacket, num_dest: usize) -> Option<usize>;
 }
 
-
 #[inline]
 fn hash_pair(x: u64, y: u32) -> u64 {
     let mut h = x ^ ((y as u64) << 32);
@@ -49,7 +56,7 @@ impl PacketRoutingStrategy for FECSetRoutingStrategy {
     fn route_packet(&self, packet: &TritonPacket, num_dest: usize) -> Option<usize> {
         let shred_buf = packet.buffer.chunk();
         let slot = solana_ledger::shred::wire::get_slot(shred_buf)?;
-        let fec =  shred_buf.get(79..79 + 4)?;
+        let fec = shred_buf.get(79..79 + 4)?;
         let fec_bytes: [u8; 4] = fec.try_into().ok()?;
         let fec_set_index = u32::from_le_bytes(fec_bytes);
         let hash = hash_pair(slot, fec_set_index);
@@ -57,8 +64,6 @@ impl PacketRoutingStrategy for FECSetRoutingStrategy {
         Some(dest)
     }
 }
-
-
 
 pub fn recv_loop<R>(
     socket: &UdpSocket,
@@ -68,23 +73,21 @@ pub fn recv_loop<R>(
     fill_rx: &mut Rx<FrameDesc>,
     packet_tx_vec: &[Tx<TritonPacket>],
     router: R,
-) -> std::io::Result<()> 
-    where R: PacketRoutingStrategy
+) -> std::io::Result<()>
+where
+    R: PacketRoutingStrategy,
 {
-    
     let mut packet_batch = Vec::with_capacity(PACKETS_PER_BATCH);
     let mut frame_bufmut_vec = Vec::with_capacity(PACKETS_PER_BATCH);
 
-
     loop {
-
         // Check for exit signal, even if socket is busy
         // (for instance the leader transaction socket)
         if exit.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-        // Refill the frame buffers as much as we can, 
+        // Refill the frame buffers as much as we can,
         'fill_bufmut: while frame_bufmut_vec.len() < PACKETS_PER_BATCH {
             let maybe_frame_buf = fill_rx.try_recv();
             match maybe_frame_buf {
@@ -104,12 +107,7 @@ pub fn recv_loop<R>(
                 }
             }
         }
-        let result = recv_from(
-            &mut frame_bufmut_vec,
-            socket,
-            coalesce,
-            &mut packet_batch,
-        );
+        let result = recv_from(&mut frame_bufmut_vec, socket, coalesce, &mut packet_batch);
         if let Ok(len) = result {
             if len > 0 {
                 let StreamerReceiveStats {
@@ -147,13 +145,11 @@ pub fn recv_loop<R>(
     }
 }
 
-
-
 pub fn recv_from(
     available_frame_buf_vec: &mut Vec<FrameBufMut>,
-    socket: &UdpSocket, 
+    socket: &UdpSocket,
     max_wait: Duration,
-    batch: &mut Vec<TritonPacket>
+    batch: &mut Vec<TritonPacket>,
 ) -> std::io::Result<usize> {
     // let mut i: usize = 0;
     //DOCUMENTED SIDE-EFFECT
@@ -171,7 +167,6 @@ pub fn recv_from(
     let mut i = 0;
 
     loop {
-
         match triton_recv_mmsg(socket, available_frame_buf_vec, &mut batch[i..]) {
             Err(_) if i > 0 => {
                 if start.elapsed() > max_wait {
@@ -225,11 +220,10 @@ impl AsRef<[u8]> for TritonPacket {
     }
 }
 
-
 pub fn triton_recv_mmsg(
-    sock: &UdpSocket, 
-    fill_buffers: &mut Vec<FrameBufMut>, 
-    packets: &mut [TritonPacket], 
+    sock: &UdpSocket,
+    fill_buffers: &mut Vec<FrameBufMut>,
+    packets: &mut [TritonPacket],
 ) -> io::Result</*num packets:*/ usize> {
     // Should never hit this, but bail if the caller didn't provide any Packets
     // to receive into
@@ -250,14 +244,13 @@ pub fn triton_recv_mmsg(
         std::array::from_fn(|_| MaybeUninit::uninit());
 
     let mut frame_buffer_inflight_cnt = 0;
-    for (hdr, iov, addr) in
-        izip!(&mut hdrs, &mut iovs, &mut addrs).take(count)
-    {   
+    for (hdr, iov, addr) in izip!(&mut hdrs, &mut iovs, &mut addrs).take(count) {
         let buffer = fill_buffers.pop().expect("insufficient fill buffers");
-        assert!(buffer.remaining_mut() >= PACKET_DATA_SIZE, "fill buffer too small");
-        let iov_base = unsafe {
-            buffer.as_mut_ptr() as *mut libc::c_void
-        };
+        assert!(
+            buffer.remaining_mut() >= PACKET_DATA_SIZE,
+            "fill buffer too small"
+        );
+        let iov_base = unsafe { buffer.as_mut_ptr() as *mut libc::c_void };
 
         iov.write(iovec {
             iov_base: iov_base,
@@ -300,7 +293,9 @@ pub fn triton_recv_mmsg(
     } else {
         usize::try_from(nrecv).unwrap()
     };
-    for (addr, hdr, pkt, filled_bufmut) in izip!(addrs, hdrs, packets.iter_mut(), frame_buffer_inflight_vec).take(nrecv) {
+    for (addr, hdr, pkt, filled_bufmut) in
+        izip!(addrs, hdrs, packets.iter_mut(), frame_buffer_inflight_vec).take(nrecv)
+    {
         // SAFETY: We initialized `count` elements of `hdrs` above. `count` is
         // passed to recvmmsg() as the limit of messages that can be read. So,
         // `nrevc <= count` which means we initialized this `hdr` and
@@ -336,7 +331,6 @@ pub fn triton_recv_mmsg(
     Ok(nrecv)
 }
 
-
 fn create_msghdr(
     msg_name: &mut MaybeUninit<sockaddr_storage>,
     msg_namelen: socklen_t,
@@ -354,7 +348,6 @@ fn create_msghdr(
     msg_hdr.msg_flags = 0;
     msg_hdr
 }
-
 
 fn cast_socket_addr(addr: &sockaddr_storage, hdr: &mmsghdr) -> Option<SocketAddr> {
     use libc::{sa_family_t, sockaddr_in, sockaddr_in6};
