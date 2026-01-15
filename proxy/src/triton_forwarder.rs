@@ -198,6 +198,7 @@ fn packet_fwd_tile(
     mut packet_rx: Rx<TritonPacket>,
     fill_tx_vec: Vec<Tx<FrameDesc>>,
     shmem_info_vec: Vec<SharedMemInfo>,
+    stats: Arc<ShredMetrics>,
     exit: Arc<AtomicBool>,
     tile_drop_sig: TileClosedSignal,
 ) -> std::io::Result<JoinHandle<()>> {
@@ -305,9 +306,13 @@ fn packet_fwd_tile(
                     queued.len()
                 );
 
+                let batch_send_ts = Instant::now();
                 match batch_send(&send_socket, &next_batch_send) {
                     Ok(_) => {
                         // Successfully sent all packets in the batch
+                        let send_duration = batch_send_ts.elapsed();
+                        stats.batch_send_time_spent.fetch_add(send_duration.as_micros() as u64, Ordering::Relaxed);
+                        stats.send_batch_count.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(SendPktsError::IoError(err, num_failed)) => {
                         error!(
@@ -355,7 +360,8 @@ pub fn run_proxy_system<R>(
     num_pkt_fwd_tiles: usize,
     pkt_router: R,
     exit: Arc<AtomicBool>,
-    stats: Arc<StreamerReceiveStats>,
+    pk_recv_stats: Arc<StreamerReceiveStats>,
+    pk_fwd_stats: Arc<ShredMetrics>,
 ) where
     R: PacketRoutingStrategy + Send + Sync + 'static,
 {
@@ -496,6 +502,7 @@ pub fn run_proxy_system<R>(
             packet_rx,
             fill_tx_vec,
             shmem_info_vec,
+            Arc::clone(&pk_fwd_stats),
             exit,
             tile_wait_group.get_tile_closed_signal(TileKind::PktFwd, pkt_fwd_idx),
         )
@@ -511,7 +518,7 @@ pub fn run_proxy_system<R>(
         fill_rx_vec.into_iter()
     ) {
         let exit = Arc::clone(&exit);
-        let forwarder_stats = Arc::clone(&stats);
+        let forwarder_stats = Arc::clone(&pk_recv_stats);
         let packet_tx_vec_clone = packet_tx_vec.clone();
         let pkt_router_clone = pkt_router.clone();
         let jh = packet_recv_tile(

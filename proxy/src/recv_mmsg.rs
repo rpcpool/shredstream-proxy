@@ -89,6 +89,7 @@ where
 
         // Refill the frame buffers as much as we can,
         'fill_bufmut: while frame_bufmut_vec.len() < PACKETS_PER_BATCH {
+            log::trace!(" Refilling frame buffers {}", frame_bufmut_vec.len());
             let maybe_frame_buf = fill_rx.try_recv();
             match maybe_frame_buf {
                 Some(frame_desc) => {
@@ -107,9 +108,12 @@ where
                 }
             }
         }
+        
         let result = recv_from(&mut frame_bufmut_vec, socket, coalesce, &mut packet_batch);
+
         if let Ok(len) = result {
             if len > 0 {
+                log::trace!("Received {} packets", len);
                 let StreamerReceiveStats {
                     packets_count,
                     packet_batches_count,
@@ -167,7 +171,7 @@ pub fn recv_from(
     let mut i = 0;
 
     loop {
-        match triton_recv_mmsg(socket, available_frame_buf_vec, &mut batch[i..]) {
+        match triton_recv_mmsg(socket, available_frame_buf_vec, batch) {
             Err(_) if i > 0 => {
                 if start.elapsed() > max_wait {
                     break;
@@ -223,11 +227,12 @@ impl AsRef<[u8]> for TritonPacket {
 pub fn triton_recv_mmsg(
     sock: &UdpSocket,
     fill_buffers: &mut Vec<FrameBufMut>,
-    packets: &mut [TritonPacket],
+    packets: &mut Vec<TritonPacket>,
 ) -> io::Result</*num packets:*/ usize> {
     // Should never hit this, but bail if the caller didn't provide any Packets
     // to receive into
-    if packets.is_empty() {
+    if fill_buffers.is_empty() {
+        log::trace!("triton_recv_mmsg: no fill buffers to receive into");
         return Ok(0);
     }
     // Assert that there are no leftovers in packets.
@@ -236,10 +241,13 @@ pub fn triton_recv_mmsg(
     let mut iovs = [MaybeUninit::uninit(); NUM_RCVMMSGS];
     let mut addrs = [MaybeUninit::zeroed(); NUM_RCVMMSGS];
     let mut hdrs = [MaybeUninit::uninit(); NUM_RCVMMSGS];
-
+    let remaining_packets = packets.capacity() - packets.len();
     let sock_fd = sock.as_raw_fd();
-    let count = cmp::min(iovs.len(), packets.len()).min(fill_buffers.len());
-
+    let count = cmp::min(iovs.len(), remaining_packets).min(fill_buffers.len());
+    log::trace!(
+        "triton_recv_mmsg: preparing to receive up to {} packets",
+        count
+    );
     let mut frame_buffer_inflight_vec: [MaybeUninit<FrameBufMut>; NUM_RCVMMSGS] =
         std::array::from_fn(|_| MaybeUninit::uninit());
 
@@ -293,8 +301,8 @@ pub fn triton_recv_mmsg(
     } else {
         usize::try_from(nrecv).unwrap()
     };
-    for (addr, hdr, pkt, filled_bufmut) in
-        izip!(addrs, hdrs, packets.iter_mut(), frame_buffer_inflight_vec).take(nrecv)
+    for (i, addr, hdr, filled_bufmut) in
+        izip!(0..nrecv, addrs, hdrs, frame_buffer_inflight_vec).take(nrecv)
     {
         // SAFETY: We initialized `count` elements of `hdrs` above. `count` is
         // passed to recvmmsg() as the limit of messages that can be read. So,
@@ -306,11 +314,15 @@ pub fn triton_recv_mmsg(
         let addr_ref = unsafe { addr.assume_init_ref() };
         let filled_bufmut = unsafe { filled_bufmut.assume_init_read() };
         let filled_buf: FrameBuf = filled_bufmut.into();
-        pkt.buffer = filled_buf;
+        let mut pkt = TritonPacket {
+            buffer: filled_buf,
+            meta: Meta::default(),
+        };
         pkt.meta_mut().size = hdr_ref.msg_len as usize;
         if let Some(addr) = cast_socket_addr(addr_ref, hdr_ref) {
             pkt.meta_mut().set_socket_addr(&addr);
         }
+        packets.push(pkt);
     }
 
     for (iov, addr, hdr) in izip!(&mut iovs, &mut addrs, &mut hdrs).take(count) {

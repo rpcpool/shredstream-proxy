@@ -337,7 +337,8 @@ fn main() -> Result<(), ShredstreamProxyError> {
     };
     let proxy_th = {
         let exit = Arc::clone(&exit);
-        let forward_stats = forward_stats.clone();
+        let pkt_recv_stats = forward_stats.clone();
+        let pkt_fwd_stats = metrics.clone();
         let unioned_dest_sockets = Arc::clone(&unioned_dest_sockets);
         std::thread::Builder::new()
         .name("tritonProxyMain".to_string())
@@ -351,7 +352,8 @@ fn main() -> Result<(), ShredstreamProxyError> {
                 args.num_pkt_fwd_tile.map(|x| x.get()).unwrap_or(1),
                 FECSetRoutingStrategy,
                 exit,
-                forward_stats,
+                pkt_recv_stats,
+                pkt_fwd_stats,
             );
         })
         .expect("tritonProxyMain")
