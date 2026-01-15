@@ -1,3 +1,4 @@
+set -e
 # 1. Create the namespace
 sudo ip netns add ns1
 
@@ -19,5 +20,7 @@ sudo ip netns exec ns1 ip link set veth1 up
 #sudo ethtool -K veth0 gro off
 #sudo ip netns exec ns1 ethtool -K veth1 gro off
 
+#nping --udp -p 1234 --data-length 500 -c 10 <destination_ip>
+
 # 7. Verify connectivity
-ping -c 2 10.0.0.11
+ping -c 2 172.31.0.2

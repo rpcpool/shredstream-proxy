@@ -28,6 +28,7 @@ mod deshred;
 pub mod forwarder;
 mod heartbeat;
 mod multicast_config;
+mod triton_multicast_config;
 mod server;
 mod token_authenticator;
 mod prom;

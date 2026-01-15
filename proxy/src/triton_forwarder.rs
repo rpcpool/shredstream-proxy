@@ -1,13 +1,7 @@
 use std::{
-    collections::VecDeque,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
-    str::FromStr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread::JoinHandle,
-    time::{Duration, Instant},
+    collections::VecDeque, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket}, num::NonZeroUsize, str::FromStr, sync::{
+        Arc, atomic::{AtomicBool, Ordering}
+    }, thread::JoinHandle, time::{Duration, Instant}
 };
 
 use arc_swap::ArcSwap;
@@ -24,14 +18,11 @@ use solana_streamer::{
 };
 
 use crate::{
-    forwarder::{try_create_ipv6_socket, ShredMetrics},
-    mem::{FrameBuf, FrameDesc, Rx, SharedMem, Tx},
-    prom::{
+    forwarder::{ShredMetrics, try_create_ipv6_socket}, mem::{FrameBuf, FrameDesc, Rx, SharedMem, Tx}, triton_multicast_config::TritonMulticastConfig, prom::{
         inc_packets_deduped, inc_packets_forward_failed,
         observe_dedup_time,
         observe_send_duration, observe_send_packet_count,
-    },
-    recv_mmsg::{PacketRoutingStrategy, TritonPacket},
+    }, recv_mmsg::{PacketRoutingStrategy, TritonPacket}
 };
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
@@ -343,6 +334,7 @@ fn packet_fwd_tile(
 pub fn run_proxy_system<R>(
     pkt_recv_tile_mem_config: PktRecvTileMemConfig,
     dest_addr_vec: Arc<ArcSwap<Vec<SocketAddr>>>,
+    multticast_config: Option<TritonMulticastConfig>,
     src_ip: IpAddr,
     src_port: u16,
     num_pkt_recv_tiles: usize,
@@ -356,15 +348,26 @@ pub fn run_proxy_system<R>(
 {
     let mut tile_thread_vec: Vec<JoinHandle<()>> = Vec::new();
     // Build pkt_recv sockets
-    let (_port, pkt_recv_sk_vec) = solana_net_utils::multi_bind_in_range_with_config(
-        src_ip,
-        (src_port, src_port + 1),
-        SocketConfig::default().reuseport(true),
-        num_pkt_recv_tiles,
-    )
-    .unwrap_or_else(|_| {
-        panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
-    });
+    let pkt_recv_sk_vec = if let Some(multicast_config) = multticast_config {
+        log::info!("Using Triton multicast configuration for pkt_recv tiles");
+        crate::triton_multicast_config::create_multicast_sockets_triton(
+            &multicast_config, 
+            NonZeroUsize::new(num_pkt_recv_tiles).expect("num_pkt_recv_tiles must be non-zero"),
+            src_ip,
+            src_port,
+        ).expect("multicast-config")
+    } else {
+        let (_port, pkt_recv_sk_vec) = solana_net_utils::multi_bind_in_range_with_config(
+            src_ip,
+            (src_port, src_port + 1),
+            SocketConfig::default().reuseport(true),
+            num_pkt_recv_tiles,
+        )
+        .unwrap_or_else(|_| {
+            panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
+        });
+        pkt_recv_sk_vec
+    };
 
     let num_frames =
         pkt_recv_tile_mem_config.memory_size as usize / pkt_recv_tile_mem_config.frame_size;

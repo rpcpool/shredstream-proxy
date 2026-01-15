@@ -72,7 +72,6 @@ where
 
         // Refill the frame buffers as much as we can,
         'fill_bufmut: while frame_bufmut_vec.len() < PACKETS_PER_BATCH {
-            log::trace!(" Refilling frame buffers {}", frame_bufmut_vec.len());
             let maybe_frame_buf = fill_rx.try_recv();
             match maybe_frame_buf {
                 Some(frame_desc) => {
@@ -91,6 +90,9 @@ where
                 }
             }
         }
+
+
+        log::trace!("frame bufmut_vec length: {}", frame_bufmut_vec.len());
         
         let t = Instant::now();
         let result = recv_from(&mut frame_bufmut_vec, socket, coalesce, &mut packet_batch);
@@ -98,6 +100,7 @@ where
         let recv_interval = t.elapsed();
 
         if let Ok(len) = result {
+            log::trace!("recv_from got {} packets in {:?}", len, recv_interval);
             if len > 0 {
                 observe_recv_interval(recv_interval.as_micros() as f64);
                 log::trace!("Received {} packets", len);
@@ -160,6 +163,7 @@ pub fn recv_from(
     let mut i = 0;
 
     loop {
+        log::trace!("Preparing to receive packets, currently have {} packets", i);
         match triton_recv_mmsg(socket, available_frame_buf_vec, batch) {
             Err(_) if i > 0 => {
                 if start.elapsed() > max_wait {
@@ -269,6 +273,7 @@ pub fn triton_recv_mmsg(
         tv_sec: 1,
         tv_nsec: 0,
     };
+    log::trace!("Calling recvmmsg for up to {} packets", count);
     // TODO: remove .try_into().unwrap() once rust libc fixes recvmmsg types for musl
     #[allow(clippy::useless_conversion)]
     let nrecv = unsafe {
@@ -280,6 +285,7 @@ pub fn triton_recv_mmsg(
             &mut ts,
         )
     };
+    trace!("recvmmsg returned nrecv={}", nrecv);
     let nrecv = if nrecv < 0 {
         // On error, return all in-flight frame buffers back to the caller
         for i in 0..frame_buffer_inflight_cnt {
@@ -290,8 +296,8 @@ pub fn triton_recv_mmsg(
     } else {
         usize::try_from(nrecv).unwrap()
     };
-    for (i, addr, hdr, filled_bufmut) in
-        izip!(0..nrecv, addrs, hdrs, frame_buffer_inflight_vec).take(nrecv)
+    for (addr, hdr, filled_bufmut) in
+        izip!(addrs, hdrs, frame_buffer_inflight_vec).take(nrecv)
     {
         // SAFETY: We initialized `count` elements of `hdrs` above. `count` is
         // passed to recvmmsg() as the limit of messages that can be read. So,
@@ -309,6 +315,7 @@ pub fn triton_recv_mmsg(
         };
         pkt.meta_mut().size = hdr_ref.msg_len as usize;
         if let Some(addr) = cast_socket_addr(addr_ref, hdr_ref) {
+            log::trace!("Received packet from {}", addr);
             pkt.meta_mut().set_socket_addr(&addr);
         }
         packets.push(pkt);

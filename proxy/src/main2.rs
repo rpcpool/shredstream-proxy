@@ -20,12 +20,12 @@ use tokio::runtime::Runtime;
 use tonic::Status;
 
 use crate::{
-    forwarder::ShredMetrics, multicast_config::{TritonMulticastConfig, TritonMulticastConfigV4, TritonMulticastConfigV6, create_multicast_sockets_triton}, recv_mmsg::FECSetRoutingStrategy, token_authenticator::BlockEngineConnectionError, triton_forwarder::PktRecvTileMemConfig,
+    forwarder::ShredMetrics, triton_multicast_config::{TritonMulticastConfig, TritonMulticastConfigV4, TritonMulticastConfigV6, create_multicast_sockets_triton}, recv_mmsg::FECSetRoutingStrategy, token_authenticator::BlockEngineConnectionError, triton_forwarder::PktRecvTileMemConfig,
 };
 pub mod deshred;
 pub mod forwarder;
 pub mod heartbeat;
-pub mod multicast_config;
+pub mod triton_multicast_config;
 pub mod server;
 pub mod token_authenticator;
 pub mod prom;
@@ -289,47 +289,31 @@ fn main() -> Result<(), ShredstreamProxyError> {
     let use_discovery_service =
         args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
 
-    // let maybe_triton_multicast_config = match args.triton_multicast_group {
-    //     Some(multicast_group) => {
-    //         match multicast_group {
-    //             IpAddr::V4(ipv4) => {
-    //                 Some(TritonMulticastConfig::Ipv4(TritonMulticastConfigV4 {
-    //                     multicast_ip: ipv4,
-    //                     bind_ifname: args.triton_multicast_bind_interface,
-    //                 }))
-    //             }
-    //             IpAddr::V6(ipv6) => {
-    //                 Some(TritonMulticastConfig::Ipv6(TritonMulticastConfigV6 {
-    //                     multicast_ip: ipv6,
-    //                     device_ifname: args.triton_multicast_bind_interface
-    //                         .ok_or_else(|| {
-    //                             io::Error::new(
-    //                                 ErrorKind::InvalidInput,
-    //                                 "triton-multicast-bind-interface is required for IPv6",
-    //                             )
-    //                         })?,
-    //                 }))
-    //             }
-    //         }
-    //     }
-    //     None => None,
-    // };
-
-    // let maybe_triton_multicast_socket = maybe_triton_multicast_config
-    //     .and_then(|config| {
-    //         let num_threads = NonZeroUsize::new(args.triton_multicast_num_threads)
-    //             .ok_or_else(|| {
-    //                 io::Error::new(
-    //                     ErrorKind::InvalidInput,
-    //                     "triton-multicast-num-threads must be non-zero",
-    //                 )
-    //             }).ok()?;
-    //         Some(
-    //             create_multicast_sockets_triton(&config, num_threads)
-    //                 .map(|ok| (config.ip(), ok))
-    //         )
-    //     })
-    //     .transpose()?;
+    let maybe_triton_multicast_config = match args.triton_multicast_group {
+        Some(multicast_group) => {
+            match multicast_group {
+                IpAddr::V4(ipv4) => {
+                    Some(TritonMulticastConfig::Ipv4(TritonMulticastConfigV4 {
+                        multicast_ip: ipv4,
+                        bind_ifname: args.triton_multicast_bind_interface,
+                    }))
+                }
+                IpAddr::V6(ipv6) => {
+                    Some(TritonMulticastConfig::Ipv6(TritonMulticastConfigV6 {
+                        multicast_ip: ipv6,
+                        device_ifname: args.triton_multicast_bind_interface
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    ErrorKind::InvalidInput,
+                                    "triton-multicast-bind-interface is required for IPv6",
+                                )
+                            })?,
+                    }))
+                }
+            }
+        }
+        None => None,
+    };
 
     let pkt_recv_tile_mem_config = PktRecvTileMemConfig {
         memory_size: args.pkt_recv_channel_memsize.unwrap_or_default(),
@@ -346,6 +330,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
             triton_forwarder::run_proxy_system(
                 pkt_recv_tile_mem_config,
                 unioned_dest_sockets,
+                maybe_triton_multicast_config,
                 args.src_bind_addr,
                 args.src_bind_port,
                 args.num_pkt_recv_tile.map(|x| x.get()).unwrap_or(1),
