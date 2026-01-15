@@ -22,16 +22,16 @@ use tonic::Status;
 use crate::{
     forwarder::ShredMetrics, multicast_config::{TritonMulticastConfig, TritonMulticastConfigV4, TritonMulticastConfigV6, create_multicast_sockets_triton}, recv_mmsg::FECSetRoutingStrategy, token_authenticator::BlockEngineConnectionError, triton_forwarder::PktRecvTileMemConfig,
 };
-mod deshred;
+pub mod deshred;
 pub mod forwarder;
-mod heartbeat;
-mod multicast_config;
-mod server;
-mod token_authenticator;
-mod prom;
-mod recv_mmsg;
-mod mem;
-mod triton_forwarder;
+pub mod heartbeat;
+pub mod multicast_config;
+pub mod server;
+pub mod token_authenticator;
+pub mod prom;
+pub mod recv_mmsg;
+pub mod mem;
+pub mod triton_forwarder;
 
 use triton_forwarder::{PktRecvMemSizing};
 

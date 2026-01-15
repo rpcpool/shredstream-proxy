@@ -194,20 +194,11 @@ impl FrameBufMut {
         ((self.ptr as usize) & !(self.desc.frame_size - 1)) as *mut u8
     }
 
-    pub fn len(&self) -> usize {
-        let base = self.base() as usize;
-        (self.ptr as usize) - base
-    }
-
     #[inline]
     pub fn capacity(&self) -> usize {
         self.desc.frame_size
     }
 
-    #[inline]
-    pub fn cast_to<T>(&self) -> *mut T {
-        self.base() as *mut T
-    }
 
     #[inline]
     fn end_ptr(&self) -> *const u8 {
@@ -604,7 +595,7 @@ mod tests {
         assert_eq!(buf_mut.remaining_mut(), 4096);
         buf_mut.put_slice(&[1, 2, 3, 4]);
         assert_eq!(buf_mut.remaining_mut(), 4092);
-        assert_eq!(buf_mut.len(), 4);
+        assert_eq!(buf_mut.chunk_mut().len(), 4);
 
         let mut buf: FrameBuf = buf_mut.into();
         assert_eq!(buf.len(), 4);

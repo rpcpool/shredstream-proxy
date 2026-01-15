@@ -1,49 +1,37 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+        Arc,
     },
-    thread::{Builder, JoinHandle},
-    time::{Duration, Instant, SystemTime},
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
 use bytes::Buf;
-use crossbeam_channel::{Receiver, RecvError, Sender};
-use dashmap::DashMap;
+use crossbeam_channel::{Receiver, Sender};
 use itertools::{izip, Itertools};
-use jito_protos::shredstream::{Entry as PbEntry, TraceShred};
 use libc;
 use log::{debug, error, info, warn};
-use prost::Message;
-use socket2::{Domain, Protocol, Socket, Type};
-use solana_client::client_error::reqwest;
-use solana_metrics::{datapoint_info, datapoint_warn};
 use solana_net_utils::SocketConfig;
-use solana_perf::{
-    deduper::Deduper,
-    packet::{PacketBatch, PacketBatchRecycler},
-    recycler::Recycler,
-};
-use solana_sdk::exit;
+use solana_perf::deduper::Deduper;
 use solana_streamer::{
     sendmmsg::{batch_send, SendPktsError},
-    streamer::{self, StreamerReceiveStats},
+    streamer::{StreamerReceiveStats},
 };
 
 use crate::{
     forwarder::{try_create_ipv6_socket, ShredMetrics},
     mem::{FrameBuf, FrameDesc, Rx, SharedMem, Tx},
     prom::{
-        inc_packets_by_source, inc_packets_deduped, inc_packets_forward_failed,
-        inc_packets_forwarded, inc_packets_received, observe_dedup_time, observe_recv_interval,
-        observe_recv_packet_count, observe_send_duration, observe_send_packet_count,
+        inc_packets_deduped, inc_packets_forward_failed,
+        observe_dedup_time,
+        observe_send_duration, observe_send_packet_count,
     },
     recv_mmsg::{PacketRoutingStrategy, TritonPacket},
-    resolve_hostname_port, ShredstreamProxyError,
 };
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
@@ -253,14 +241,18 @@ fn packet_fwd_tile(
                     };
                     let data_size = packet.meta.size;
                     let data_slice = &packet.buffer.chunk()[..data_size];
+                    let t = Instant::now();
                     if deduper.dedup(data_slice) {
                         // put it inside the recycle queue
                         debug!("Deduped packet from {}", packet.meta.addr);
                         let desc = packet.buffer.into_inner();
                         recycled_frames.push(desc);
+                        inc_packets_deduped(1);
                     } else {
                         queued.push_back(packet);
                     }
+                    let dedup_duration = t.elapsed();
+                    observe_dedup_time(dedup_duration.as_micros() as f64);
                 }
 
                 let dests = hot_dest_vec.load();
@@ -313,6 +305,8 @@ fn packet_fwd_tile(
                         let send_duration = batch_send_ts.elapsed();
                         stats.batch_send_time_spent.fetch_add(send_duration.as_micros() as u64, Ordering::Relaxed);
                         stats.send_batch_count.fetch_add(1, Ordering::Relaxed);
+                        observe_send_duration(send_duration.as_micros() as f64);
+                        observe_send_packet_count(next_batch_send.len() as f64);
                     }
                     Err(SendPktsError::IoError(err, num_failed)) => {
                         error!(
@@ -320,8 +314,11 @@ fn packet_fwd_tile(
                              {num_failed} packets failed. Error: {err}",
                             next_batch_send.len()
                         );
+                        inc_packets_forward_failed(num_failed as u64);
                     }
                 }
+
+                next_batch_send.clear();
 
                 // Recycle all used frames
                 while let Some(desc) = recycled_frames.pop() {
@@ -341,14 +338,6 @@ fn packet_fwd_tile(
             log::info!("Exiting pkt_fwd_tile {}", packet_fwd_idx);
             drop(tile_drop_sig);
         })
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum ProxySystemError {
-    #[error(transparent)]
-    IoError(std::io::Error),
-    #[error(transparent)]
-    AllocError(crate::mem::AllocError),
 }
 
 pub fn run_proxy_system<R>(

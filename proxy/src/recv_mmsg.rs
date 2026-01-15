@@ -1,7 +1,5 @@
 use std::{
     cmp,
-    collections::VecDeque,
-    hint::spin_loop,
     io,
     mem::{self, zeroed, MaybeUninit},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
@@ -15,26 +13,11 @@ use itertools::izip;
 use libc::{iovec, mmsghdr, msghdr, sockaddr_storage, AF_INET, AF_INET6, MSG_WAITFORONE};
 use log::{error, trace};
 use socket2::socklen_t;
-use solana_ledger::shred::ShredId;
 use solana_perf::packet::{NUM_RCVMMSGS, PACKETS_PER_BATCH};
-use solana_sdk::packet::{Meta, Packet, PACKET_DATA_SIZE};
-use solana_streamer::{recvmmsg::recv_mmsg, streamer::StreamerReceiveStats};
+use solana_sdk::packet::{Meta, PACKET_DATA_SIZE};
+use solana_streamer::{streamer::StreamerReceiveStats};
 
-use crate::mem::{try_alloc_shared_mem, FrameBuf, FrameBufMut, FrameDesc, Rx, SharedMem, Tx};
-
-const OFFSET_SHRED_TYPE: usize = 82;
-const OFFSET_DATA_PARENT: usize = 83; // 83 + 0
-const OFFSET_DATA_INDEX: usize = 83 - 15; // Index is actually in common header
-const OFFSET_CODING_POSITION: usize = 83 + 2;
-
-// Shred types based on Solana spec
-const SHRED_TYPE_DATA: u8 = 0b1010_0101;
-const SHRED_TYPE_CODING: u8 = 0b0101_1010;
-
-pub struct RecvMemConfig {
-    pub frames_count: usize,
-    pub hugepages: bool,
-}
+use crate::{mem::{FrameBuf, FrameBufMut, FrameDesc, Rx, Tx}, prom::{inc_packets_by_source, inc_packets_received, observe_recv_interval, observe_recv_packet_count}};
 
 pub trait PacketRoutingStrategy: Clone {
     fn route_packet(&self, packet: &TritonPacket, num_dest: usize) -> Option<usize>;
@@ -109,11 +92,17 @@ where
             }
         }
         
+        let t = Instant::now();
         let result = recv_from(&mut frame_bufmut_vec, socket, coalesce, &mut packet_batch);
+
+        let recv_interval = t.elapsed();
 
         if let Ok(len) = result {
             if len > 0 {
+                observe_recv_interval(recv_interval.as_micros() as f64);
                 log::trace!("Received {} packets", len);
+                inc_packets_received(len as u64);
+                observe_recv_packet_count(len as f64);
                 let StreamerReceiveStats {
                     packets_count,
                     packet_batches_count,
