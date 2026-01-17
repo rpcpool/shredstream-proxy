@@ -209,6 +209,18 @@ impl FrameBufMut {
     pub unsafe fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr
     }
+
+    #[inline]
+    pub unsafe fn seek(&mut self, offset: usize) {
+        assert!(
+            offset < self.desc.frame_size,
+            "seek offset out of bounds"
+        );
+        let new_ptr = self.desc.ptr.add(offset);
+        let end_ptr = self.end_ptr();
+        assert!(new_ptr as *const u8 <= end_ptr, "seek out of bounds");
+        self.ptr = new_ptr;
+    }
 }
 
 unsafe impl BufMut for FrameBufMut {
@@ -254,7 +266,7 @@ impl Buf for FrameBuf {
 use std::{ptr, sync::atomic::AtomicBool};
 
 // We wrap T to include a 'ready' flag for each slot
-#[repr(C, align(64))]
+#[repr(C)]
 struct Slot<T: Sized> {
     data: std::mem::MaybeUninit<T>,
     is_ready: AtomicBool,
@@ -313,10 +325,10 @@ pub struct Rx<T> {
 
 pub fn message_ring<T>(capacity: usize) -> Result<(Tx<T>, Rx<T>), AllocError> {
     let capacity = capacity.next_power_of_two();
-    let align = std::mem::size_of::<Slot<T>>();
+    let size = std::mem::size_of::<Slot<T>>();
 
     // Allocate memory for Slots
-    let shmem = SharedMem::new(align, capacity, false)?;
+    let shmem = SharedMem::new(size, capacity, false)?;
     let ptr = shmem.ptr as *mut Slot<T>;
     // Initialize the is_ready flags to false
     for i in 0..capacity {
@@ -354,9 +366,20 @@ impl<T> Tx<T> {
             let head = self.inner.head.load(Ordering::Relaxed);
             let tail = self.inner.tail.load(Ordering::Acquire);
 
-            if head.wrapping_sub(tail) >= self.inner.capacity {
-                return Err(value); // Ring is full
+            // 2. The Fix: Calculate occupancy with wrapping awareness
+            let occupancy = head.wrapping_sub(tail);
+
+            // A ring is only full if occupancy is >= capacity.
+            // We add a check for (usize::MAX / 2) to ignore the "stale head" 
+            // cases where occupancy underflows to a massive number.
+            if occupancy >= self.inner.capacity && occupancy < (usize::MAX / 2) {
+                return Err(value); 
             }
+
+            // if head.wrapping_sub(tail) >= self.inner.capacity {
+            //     log::error!("Ring is full: head={}, tail={}, capacity={}", head, tail, self.inner.capacity);
+            //     return Err(value); // Ring is full
+            // }
 
             // 2. Claim a slot using Compare-and-Swap (CAS).
             // We use SeqCst or AcqRel here to ensure that once we "win" this slot,

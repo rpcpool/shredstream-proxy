@@ -14,10 +14,10 @@ use libc::{iovec, mmsghdr, msghdr, sockaddr_storage, AF_INET, AF_INET6, MSG_WAIT
 use log::{error, trace};
 use socket2::socklen_t;
 use solana_perf::packet::{NUM_RCVMMSGS, PACKETS_PER_BATCH};
-use solana_sdk::packet::{Meta, PACKET_DATA_SIZE};
+use solana_sdk::{exit, packet::{Meta, PACKET_DATA_SIZE}};
 use solana_streamer::{streamer::StreamerReceiveStats};
 
-use crate::{mem::{FrameBuf, FrameBufMut, FrameDesc, Rx, Tx}, prom::{inc_packets_by_source, inc_packets_received, observe_recv_interval, observe_recv_packet_count}};
+use crate::{mem::{FrameBuf, FrameBufMut, FrameDesc, Rx, Tx}, prom::{inc_packets_received, observe_recv_interval, observe_recv_packet_count}};
 
 pub trait PacketRoutingStrategy: Clone {
     fn route_packet(&self, packet: &TritonPacket, num_dest: usize) -> Option<usize>;
@@ -62,8 +62,19 @@ where
 {
     let mut packet_batch = Vec::with_capacity(PACKETS_PER_BATCH);
     let mut frame_bufmut_vec = Vec::with_capacity(PACKETS_PER_BATCH);
-
+    let mut next_stats_report = Instant::now() + Duration::from_secs(1);
+    let mut router_dest_dist = vec![0usize; packet_tx_vec.len()];
     loop {
+
+        if next_stats_report.elapsed() > Duration::ZERO {
+            next_stats_report = Instant::now() + Duration::from_secs(1);
+            log::trace!(
+                "recv_loop: packets_count={}, packet_batches_count={}, full_packet_batches_count={}",
+                stats.packets_count.load(Ordering::Relaxed),
+                stats.packet_batches_count.load(Ordering::Relaxed),
+                stats.full_packet_batches_count.load(Ordering::Relaxed),
+            );
+        }
         // Check for exit signal, even if socket is busy
         // (for instance the leader transaction socket)
         if exit.load(Ordering::Relaxed) {
@@ -81,7 +92,9 @@ where
                 None => {
                     if frame_bufmut_vec.is_empty() {
                         // block until we get at least one frame buffer
-                        let frame_desc = fill_rx.recv();
+                        let Some(frame_desc) = fill_rx.recv_timeout(Duration::from_millis(10)) else {
+                            break 'fill_bufmut
+                        };
                         let frame_bufmut = frame_desc.as_mut_buf();
                         frame_bufmut_vec.push(frame_bufmut);
                     } else {
@@ -91,51 +104,61 @@ where
             }
         }
 
+        if frame_bufmut_vec.is_empty() {
+            // No available frame buffers to receive into, wait a bit
+            log::debug!("recv_loop: no available frame buffers to receive into");
+            continue;
+        }
 
         log::trace!("frame bufmut_vec length: {}", frame_bufmut_vec.len());
         
         let t = Instant::now();
-        let result = recv_from(&mut frame_bufmut_vec, socket, coalesce, &mut packet_batch);
-
+        let result = recv_from(&mut frame_bufmut_vec, socket, coalesce, &mut packet_batch, &exit);
         let recv_interval = t.elapsed();
 
-        if let Ok(len) = result {
-            log::trace!("recv_from got {} packets in {:?}", len, recv_interval);
-            if len > 0 {
-                observe_recv_interval(recv_interval.as_micros() as f64);
-                log::trace!("Received {} packets", len);
-                inc_packets_received(len as u64);
-                observe_recv_packet_count(len as f64);
-                let StreamerReceiveStats {
-                    packets_count,
-                    packet_batches_count,
-                    full_packet_batches_count,
-                    ..
-                } = stats;
+        match result {
+            Ok(len) => {
+                log::trace!("recv_from got {} packets in {:?}", len, recv_interval);
+                if len > 0 {
+                    // observe_recv_interval(recv_interval.as_micros() as f64);
+                    log::trace!("Received {} packets", len);
+                    inc_packets_received(len as u64);
+                    observe_recv_packet_count(len as f64);
+                    let StreamerReceiveStats {
+                        packets_count,
+                        packet_batches_count,
+                        full_packet_batches_count,
+                        ..
+                    } = stats;
 
-                packets_count.fetch_add(len, Ordering::Relaxed);
-                packet_batches_count.fetch_add(1, Ordering::Relaxed);
-                if len == PACKETS_PER_BATCH {
-                    full_packet_batches_count.fetch_add(1, Ordering::Relaxed);
-                }
-                packet_batch
-                    .iter_mut()
-                    .for_each(|p| p.meta_mut().set_from_staked_node(false));
+                    packets_count.fetch_add(len, Ordering::Relaxed);
+                    packet_batches_count.fetch_add(1, Ordering::Relaxed);
+                    if len == PACKETS_PER_BATCH {
+                        full_packet_batches_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    packet_batch
+                        .iter_mut()
+                        .for_each(|p| p.meta_mut().set_from_staked_node(false));
 
-                for packet in packet_batch.drain(..) {
-                    let dest_idx = match router.route_packet(&packet, packet_tx_vec.len()) {
-                        Some(idx) => idx,
-                        None => {
-                            log::debug!("Failed to route packet {:?}", packet);
-                            let trashed_frame_bufmut = packet.buffer.into_inner().as_mut_buf();
-                            frame_bufmut_vec.push(trashed_frame_bufmut);
-                            continue;
-                        }
-                    };
-                    let _ = &packet_tx_vec[dest_idx]
-                        .send(packet)
-                        .expect("Failed to send packet to processor");
+                    for packet in packet_batch.drain(..) {
+                        let dest_idx = match router.route_packet(&packet, packet_tx_vec.len()) {
+                            Some(idx) => idx,
+                            None => {
+                                log::debug!("Failed to route packet {:?}", packet);
+                                let trashed_frame_bufmut = packet.buffer.into_inner().as_mut_buf();
+                                frame_bufmut_vec.push(trashed_frame_bufmut);
+                                continue;
+                            }
+                        };
+                        router_dest_dist[dest_idx] += 1;
+                        let _ = &packet_tx_vec[dest_idx]
+                            .send(packet)
+                            .expect(format!("failed to send packet to {dest_idx} ring is full, distr:{:?}", router_dest_dist).as_str());
+                    }
                 }
+            }
+            Err(e) => {
+                error!("recv_from error: {:?}", e);
             }
         }
     }
@@ -146,6 +169,7 @@ pub fn recv_from(
     socket: &UdpSocket,
     max_wait: Duration,
     batch: &mut Vec<TritonPacket>,
+    exit: &AtomicBool,
 ) -> std::io::Result<usize> {
     // let mut i: usize = 0;
     //DOCUMENTED SIDE-EFFECT
@@ -162,7 +186,7 @@ pub fn recv_from(
 
     let mut i = 0;
 
-    loop {
+    while !exit.load(Ordering::Relaxed) {
         log::trace!("Preparing to receive packets, currently have {} packets", i);
         match triton_recv_mmsg(socket, available_frame_buf_vec, batch) {
             Err(_) if i > 0 => {
@@ -273,8 +297,8 @@ pub fn triton_recv_mmsg(
         tv_sec: 1,
         tv_nsec: 0,
     };
-    log::trace!("Calling recvmmsg for up to {} packets", count);
-    // TODO: remove .try_into().unwrap() once rust libc fixes recvmmsg types for musl
+    // TODO: remove .try_into().unwrap() once rust libc fixes recvmmsg types for musl 
+    log::trace!("Calling recvmmsg with count={}", count);
     #[allow(clippy::useless_conversion)]
     let nrecv = unsafe {
         libc::recvmmsg(
@@ -285,7 +309,7 @@ pub fn triton_recv_mmsg(
             &mut ts,
         )
     };
-    trace!("recvmmsg returned nrecv={}", nrecv);
+    log::trace!("recvmmsg returned nrecv={}", nrecv);
     let nrecv = if nrecv < 0 {
         // On error, return all in-flight frame buffers back to the caller
         for i in 0..frame_buffer_inflight_cnt {
@@ -307,7 +331,8 @@ pub fn triton_recv_mmsg(
         // SAFETY: Similar to above, we initialized this `addr` and recvmmsg()
         // will have populated it
         let addr_ref = unsafe { addr.assume_init_ref() };
-        let filled_bufmut = unsafe { filled_bufmut.assume_init_read() };
+        let mut filled_bufmut = unsafe { filled_bufmut.assume_init_read() };
+        unsafe { filled_bufmut.seek(hdr_ref.msg_len as usize); }
         let filled_buf: FrameBuf = filled_bufmut.into();
         let mut pkt = TritonPacket {
             buffer: filled_buf,
@@ -315,7 +340,6 @@ pub fn triton_recv_mmsg(
         };
         pkt.meta_mut().size = hdr_ref.msg_len as usize;
         if let Some(addr) = cast_socket_addr(addr_ref, hdr_ref) {
-            log::trace!("Received packet from {}", addr);
             pkt.meta_mut().set_socket_addr(&addr);
         }
         packets.push(pkt);

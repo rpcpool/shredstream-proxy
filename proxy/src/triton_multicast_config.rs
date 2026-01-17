@@ -148,6 +148,7 @@ pub fn create_multicast_sockets_triton_v4(
         },
         None => Ipv4Addr::UNSPECIFIED,
     };
+    log::info!("multicast device  {} has ip {}", config.bind_ifname.as_deref().unwrap_or("unspecified"), device_ip);
     let IpAddr::V4(src_ip) = src_ip else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Source IP must be IPv4"));
     };
@@ -157,6 +158,7 @@ pub fn create_multicast_sockets_triton_v4(
     first_socket.set_reuse_port(true)?;
     first_socket.bind(&SockAddr::from(SocketAddr::new(IpAddr::V4(src_ip), src_port)))?;
     first_socket.join_multicast_v4(&config.multicast_ip, &device_ip)?;
+    log::info!("Joined multicast group {} on device IP {}", config.multicast_ip, device_ip);
     let local_port = first_socket.local_addr()?.as_socket().unwrap().port();
 
     // Step 2: Create N-1 sockets using that same port

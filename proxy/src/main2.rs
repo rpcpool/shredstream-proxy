@@ -148,6 +148,10 @@ struct CommonArgs {
     /// Memory sizing for EACH packet receiver, uses t-shirt size convention (xs (default),s,m,l,xl,2xl,3xl,4xl,5xl). Each size increase double the memory, starting at 128MiB for x-small.
     #[arg(long, env)]
     pkt_recv_channel_memsize: Option<PktRecvMemSizing>,
+
+    /// Use hugepage memory for pkt recv tiles shared memory.
+    #[arg(long, env, default_value_t = false)]
+    hugepage: bool,
 }
 
 #[derive(Debug, Error)]
@@ -291,6 +295,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
 
     let maybe_triton_multicast_config = match args.triton_multicast_group {
         Some(multicast_group) => {
+            log::info!("Using triton multicast group: {}", multicast_group);
             match multicast_group {
                 IpAddr::V4(ipv4) => {
                     Some(TritonMulticastConfig::Ipv4(TritonMulticastConfigV4 {
@@ -317,6 +322,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
 
     let pkt_recv_tile_mem_config = PktRecvTileMemConfig {
         memory_size: args.pkt_recv_channel_memsize.unwrap_or_default(),
+        hugepage: args.hugepage,
         ..Default::default()
     };
     let proxy_th = {
@@ -357,14 +363,13 @@ fn main() -> Result<(), ShredstreamProxyError> {
     };
     thread_handles.push(report_metrics_thread);
 
-    // let metrics_hdl = forwarder::start_forwarder_accessory_thread(
-    //     deduper,
-    //     metrics.clone(),
-    //     args.metrics_report_interval_ms,
-    //     shutdown_receiver.clone(),
-    //     exit.clone(),
-    // );
-    // thread_handles.push(metrics_hdl);
+    let metrics_hdl = triton_forwarder::start_forwarder_accessory_thread(
+        metrics.clone(),
+        args.metrics_report_interval_ms,
+        shutdown_receiver.clone(),
+        exit.clone(),
+    );
+    thread_handles.push(metrics_hdl);
     if use_discovery_service {
         let refresh_handle = forwarder::start_destination_refresh_thread(
             args.endpoint_discovery_url.unwrap(),

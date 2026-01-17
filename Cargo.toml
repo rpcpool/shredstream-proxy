@@ -2,6 +2,10 @@
 members = ["examples", "jito_protos", "proxy"]
 resolver = "2"
 
+[profile.debug-release]
+inherits = "release"
+debug = true
+
 [workspace.package]
 version = "0.2.12-triton"
 description = "Fast path to receive shreds from Jito, forwarding to local consumers. See https://docs.jito.wtf/lowlatencytxnfeed/ for details."

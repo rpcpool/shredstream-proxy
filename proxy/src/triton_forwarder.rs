@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket}, num::NonZeroUsize, str::FromStr, sync::{
+    collections::VecDeque, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket}, num::NonZeroUsize, os::fd::AsRawFd, str::FromStr, sync::{
         Arc, atomic::{AtomicBool, Ordering}
     }, thread::JoinHandle, time::{Duration, Instant}
 };
@@ -18,11 +18,9 @@ use solana_streamer::{
 };
 
 use crate::{
-    forwarder::{ShredMetrics, try_create_ipv6_socket}, mem::{FrameBuf, FrameDesc, Rx, SharedMem, Tx}, triton_multicast_config::TritonMulticastConfig, prom::{
-        inc_packets_deduped, inc_packets_forward_failed,
-        observe_dedup_time,
-        observe_send_duration, observe_send_packet_count,
-    }, recv_mmsg::{PacketRoutingStrategy, TritonPacket}
+    forwarder::{ShredMetrics, try_create_ipv6_socket}, mem::{FrameBuf, FrameDesc, Rx, SharedMem, Tx}, prom::{
+        inc_packets_deduped, inc_packets_forward_failed, observe_dedup_time, observe_recv_interval, observe_send_duration, observe_send_packet_count
+    }, recv_mmsg::{PacketRoutingStrategy, TritonPacket}, triton_multicast_config::TritonMulticastConfig
 };
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
@@ -190,6 +188,8 @@ fn packet_fwd_tile(
             let mut next_batch_send: Vec<(FrameBuf, SocketAddr)> = Vec::with_capacity(UIO_MAXIOV);
             let mut queued: VecDeque<TritonPacket> = VecDeque::with_capacity(UIO_MAXIOV);
 
+            let mut last_batch_to_send = Instant::now();
+
             for shmem_info in &shmem_info_vec {
                 assert!(
                     shmem_info.len.is_power_of_two(),
@@ -207,6 +207,15 @@ fn packet_fwd_tile(
                         DEDUPER_RESET_CYCLE,
                     );
                     next_deduper_reset_attempt = Instant::now() + Duration::from_secs(2);
+                    // show stats here...
+                    log::trace!(
+                        "send_batch_count: {}, duplicate: {}, total-pkt-sent: {}, queue-len: {}, to-recycle: {}", 
+                        stats.send_batch_count.load(Ordering::Relaxed), 
+                        stats.duplicate.load(Ordering::Relaxed),
+                        stats.send_batch_size_sum.load(Ordering::Relaxed),
+                        queued.len(),
+                        recycled_frames.len(),
+                    );
                 }
 
                 if queued.is_empty() && recycled_frames.is_empty() && next_batch_send.is_empty() {
@@ -215,9 +224,9 @@ fn packet_fwd_tile(
                         let data_slice = &packet.buffer.chunk()[..data_size];
                         if deduper.dedup(data_slice) {
                             // put it inside the recycle queue
-                            debug!("Deduped packet from {}", packet.meta.addr);
                             let desc = packet.buffer.into_inner();
                             recycled_frames.push(desc);
+                            stats.duplicate.fetch_add(1, Ordering::Relaxed);
                         } else {
                             queued.push_back(packet);
                         }
@@ -235,9 +244,9 @@ fn packet_fwd_tile(
                     let t = Instant::now();
                     if deduper.dedup(data_slice) {
                         // put it inside the recycle queue
-                        debug!("Deduped packet from {}", packet.meta.addr);
                         let desc = packet.buffer.into_inner();
                         recycled_frames.push(desc);
+                        stats.duplicate.fetch_add(1, Ordering::Relaxed);
                         inc_packets_deduped(1);
                     } else {
                         queued.push_back(packet);
@@ -248,14 +257,13 @@ fn packet_fwd_tile(
 
                 let dests = hot_dest_vec.load();
                 let dests_len = dests.len();
-
                 // Fill up the next_batch_send
                 'fill_batch_send: while next_batch_send.len() < UIO_MAXIOV
                     && queued.len() > 0
-                    && dests_len > 0
+                    && recycled_frames.len() < UIO_MAXIOV
                 {
                     let remaining = UIO_MAXIOV - next_batch_send.len();
-                    if dests_len < remaining {
+                    if dests_len > remaining {
                         break 'fill_batch_send;
                     }
 
@@ -288,27 +296,34 @@ fn packet_fwd_tile(
                     "queued.len() = {}",
                     queued.len()
                 );
-
+                
                 let batch_send_ts = Instant::now();
-                match batch_send(&send_socket, &next_batch_send) {
-                    Ok(_) => {
-                        // Successfully sent all packets in the batch
-                        let send_duration = batch_send_ts.elapsed();
-                        stats.batch_send_time_spent.fetch_add(send_duration.as_micros() as u64, Ordering::Relaxed);
-                        stats.send_batch_count.fetch_add(1, Ordering::Relaxed);
-                        observe_send_duration(send_duration.as_micros() as f64);
-                        observe_send_packet_count(next_batch_send.len() as f64);
-                    }
-                    Err(SendPktsError::IoError(err, num_failed)) => {
-                        error!(
-                            "Failed to send batch of size {}. \
-                             {num_failed} packets failed. Error: {err}",
-                            next_batch_send.len()
-                        );
-                        inc_packets_forward_failed(num_failed as u64);
+                
+                if !next_batch_send.is_empty() {
+                    let e = last_batch_to_send.elapsed();
+                    last_batch_to_send = Instant::now();
+                    
+                    observe_recv_interval(e.as_micros() as f64);
+                    match batch_send(&send_socket, &next_batch_send) {
+                        Ok(_) => {
+                            // Successfully sent all packets in the batch
+                            let send_duration = batch_send_ts.elapsed();
+                            stats.batch_send_time_spent.fetch_add(send_duration.as_micros() as u64, Ordering::Relaxed);
+                            stats.send_batch_count.fetch_add(1, Ordering::Relaxed);
+                            stats.send_batch_size_sum.fetch_add(next_batch_send.len() as u64, Ordering::Relaxed);
+                            observe_send_duration(send_duration.as_micros() as f64);
+                            observe_send_packet_count(next_batch_send.len() as f64);
+                        }
+                        Err(SendPktsError::IoError(err, num_failed)) => {
+                            error!(
+                                "Failed to send batch of size {}. \
+                                {num_failed} packets failed. Error: {err}",
+                                next_batch_send.len()
+                            );
+                            inc_packets_forward_failed(num_failed as u64);
+                        }
                     }
                 }
-
                 next_batch_send.clear();
 
                 // Recycle all used frames
@@ -316,8 +331,9 @@ fn packet_fwd_tile(
                     let fill_ring_idx = shmem_info_vec
                         .iter()
                         .find_position(|shmem_info| {
-                            (desc.ptr as usize) & (shmem_info.len - 1)
-                                == (shmem_info.start_ptr as usize)
+                            let p = desc.ptr as usize;
+                            let start = shmem_info.start_ptr as usize;
+                            p >= start && p < start + shmem_info.len
                         })
                         .expect("unknown frame desc")
                         .0;
@@ -368,6 +384,12 @@ pub fn run_proxy_system<R>(
         });
         pkt_recv_sk_vec
     };
+    assert!(pkt_recv_sk_vec.len() == num_pkt_recv_tiles, "pkt_recv_sk_vec.len() ({}) != num_pkt_recv_tiles ({})", pkt_recv_sk_vec.len(), num_pkt_recv_tiles);
+
+    let mut pkt_recv_sk_raw_fd_vec: Vec<i32> = Vec::with_capacity(num_pkt_recv_tiles);
+    for sk in &pkt_recv_sk_vec {
+        pkt_recv_sk_raw_fd_vec.push(sk.as_raw_fd());
+    }
 
     let num_frames =
         pkt_recv_tile_mem_config.memory_size as usize / pkt_recv_tile_mem_config.frame_size;
@@ -380,6 +402,8 @@ pub fn run_proxy_system<R>(
     let mut shmem_vec: Vec<SharedMem> = Vec::with_capacity(num_pkt_recv_tiles);
 
     let mut pkt_fwd_sk_vec: Vec<UdpSocket> = Vec::with_capacity(num_pkt_fwd_tiles);
+    let mut pkt_fwd_sk_raw_fd_vec: Vec<i32> = Vec::with_capacity(num_pkt_fwd_tiles);
+
     let mut packet_rx_vec: Vec<Rx<TritonPacket>> = Vec::with_capacity(num_pkt_fwd_tiles);
     let mut packet_tx_vec: Vec<Tx<TritonPacket>> = Vec::with_capacity(num_pkt_fwd_tiles);
 
@@ -462,20 +486,28 @@ pub fn run_proxy_system<R>(
             "Packet forwarder sending socket bound to {}",
             send_socket.local_addr().unwrap()
         );
+        pkt_fwd_sk_raw_fd_vec.push(send_socket.as_raw_fd());
         pkt_fwd_sk_vec.push(send_socket);
     }
+
+
+    let pkt_fwd_tile_ring_capacity = num_frames * num_pkt_recv_tiles;
+    log::info!(
+        "Setting pkt_fwd tile's message ring capacity to {} (num_frames {} * num_pkt_recv_tiles {})",
+        pkt_fwd_tile_ring_capacity,
+        num_frames,
+        num_pkt_recv_tiles
+    );
 
     // Create pkt_fwd message rings
     // One ring per pkt_fwd tile
     for _ in 0..num_pkt_fwd_tiles {
-        let (packet_tx, packet_rx) = crate::mem::message_ring(num_frames).expect("pkt_fwd ring");
+        // Worst case scenario all frames from all pkt_recv tiles are sent to this pkt_fwd tile
+        // We set the ring capacity to that
+        let (packet_tx, packet_rx) = crate::mem::message_ring(pkt_fwd_tile_ring_capacity).expect("pkt_fwd ring");
         packet_tx_vec.push(packet_tx);
         packet_rx_vec.push(packet_rx);
     }
-    log::info!(
-        "Initialized pkt_fwd message rings with {} slots",
-        num_frames
-    );
 
     // Spawn pkt_fwd tiles
     for (pkt_fwd_idx, pkt_fwd_sk, packet_rx) in izip!(
@@ -528,6 +560,7 @@ pub fn run_proxy_system<R>(
         log::info!("Spawned pkt_recv tile {}", pkt_recv_idx);
     }
 
+    
     let (kind, idx) = tile_wait_group.wait_first();
     warn!("Tile of kind {kind:?} with idx {idx} has exited. Shutting down proxy system");
 
@@ -535,12 +568,61 @@ pub fn run_proxy_system<R>(
     drop(fill_tx_vec);
     drop(packet_tx_vec);
     log::info!("Waiting for {} tile threads to exit", tile_thread_vec.len());
+
+
+    // There is a special case where pkt_recv could be blocked inside recvmmsg syscall if no new packets arrive in a triton_recv_msg iteratoin (when newly set to blocking mode).
+    // We have to force close the socket to break it out of the syscall.
+    for sk_fd in pkt_recv_sk_raw_fd_vec {
+        unsafe {
+            libc::close(sk_fd);
+        }
+    }
+
+    for sk_fd in pkt_fwd_sk_raw_fd_vec {
+        unsafe {
+            libc::close(sk_fd);
+        }
+    }
+
     for th in tile_thread_vec {
         let result = th.join();
         if let Err(e) = result {
             error!("Tile thread join error: {:?}", e);
         }
     }
+}
+
+
+
+
+/// Reset dedup + send metrics to influx
+pub fn start_forwarder_accessory_thread(
+    metrics: Arc<ShredMetrics>,
+    metrics_update_interval_ms: u64,
+    shutdown_receiver: Receiver<()>,
+    exit: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("ssPxyAccessory".to_string())
+        .spawn(move || {
+            let metrics_tick =
+                crossbeam_channel::tick(Duration::from_millis(metrics_update_interval_ms));
+            while !exit.load(Ordering::Relaxed) {
+                crossbeam_channel::select! {
+                    // send metrics to influx
+                    recv(metrics_tick) -> _ => {
+                        metrics.report();
+                        metrics.reset();
+                    }
+
+                    // handle SIGINT shutdown
+                    recv(shutdown_receiver) -> _ => {
+                        break;
+                    }
+                }
+            }
+        })
+        .unwrap()
 }
 
 // #[cfg(test)]

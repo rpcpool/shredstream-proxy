@@ -1,0 +1,75 @@
+set 1:
+
+shredstream_recv_interval_usec_bucket{le="1"} 41
+
+shredstream_recv_interval_usec_bucket{le="5"} 63
+
+shredstream_recv_interval_usec_bucket{le="10"} 125
+
+shredstream_recv_interval_usec_bucket{le="25"} 47676
+
+shredstream_recv_interval_usec_bucket{le="50"} 104430
+
+shredstream_recv_interval_usec_bucket{le="100"} 162673
+
+shredstream_recv_interval_usec_bucket{le="200"} 190777
+
+shredstream_recv_interval_usec_bucket{le="500"} 205050
+
+shredstream_recv_interval_usec_bucket{le="1000"} 210046
+
+shredstream_recv_interval_usec_bucket{le="2000"} 212204
+
+shredstream_recv_interval_usec_bucket{le="+Inf"} 214080
+
+
+
+set 2:
+
+shredstream_recv_interval_usec_bucket{le="1"} 0
+
+shredstream_recv_interval_usec_bucket{le="5"} 0
+
+shredstream_recv_interval_usec_bucket{le="10"} 22
+
+shredstream_recv_interval_usec_bucket{le="25"} 864700
+
+shredstream_recv_interval_usec_bucket{le="50"} 1059516
+
+shredstream_recv_interval_usec_bucket{le="100"} 1334130
+
+shredstream_recv_interval_usec_bucket{le="200"} 1473381
+
+shredstream_recv_interval_usec_bucket{le="500"} 1545124
+
+shredstream_recv_interval_usec_bucket{le="1000"} 1569639
+
+shredstream_recv_interval_usec_bucket{le="2000"} 1580383
+
+shredstream_recv_interval_usec_bucket{le="+Inf"} 1589948
+
+
+
+set 3 :
+
+shredstream_recv_interval_usec_bucket{le="1"} 0
+
+shredstream_recv_interval_usec_bucket{le="5"} 0
+
+shredstream_recv_interval_usec_bucket{le="10"} 2
+
+shredstream_recv_interval_usec_bucket{le="25"} 129306
+
+shredstream_recv_interval_usec_bucket{le="50"} 159982
+
+shredstream_recv_interval_usec_bucket{le="100"} 202752
+
+shredstream_recv_interval_usec_bucket{le="200"} 225469
+
+shredstream_recv_interval_usec_bucket{le="500"} 238215
+
+shredstream_recv_interval_usec_bucket{le="1000"} 242741
+
+shredstream_recv_interval_usec_bucket{le="2000"} 244727
+
+shredstream_recv_interval_usec_bucket{le="+Inf"} 246249
