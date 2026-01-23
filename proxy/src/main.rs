@@ -231,7 +231,9 @@ fn shutdown_notifier(exit: Arc<AtomicBool>) -> io::Result<(Sender<()>, Receiver<
 
 pub type ReconstructedShredsMap = HashMap<Slot, HashMap<u32 /* fec_set_index */, Vec<Shred>>>;
 fn main() -> Result<(), ShredstreamProxyError> {
-    env_logger::builder().init();
+    env_logger::builder()
+        .target(env_logger::Target::Stdout)
+        .init();
     let prom_registry  = prometheus::Registry::new();
     prom::register_metrics(&prom_registry);
     let all_args: Args = Args::parse();
