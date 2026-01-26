@@ -11,7 +11,7 @@ use std::{
 use bytes::{Buf, BufMut};
 use itertools::izip;
 use libc::{AF_INET, AF_INET6, MSG_DONTWAIT, iovec, mmsghdr, msghdr, sockaddr_storage};
-use log::{error, trace};
+use log::error;
 use mio::Poll;
 use socket2::socklen_t;
 use solana_perf::packet::{NUM_RCVMMSGS, PACKETS_PER_BATCH};
@@ -144,8 +144,6 @@ where
                 log::debug!("recv_loop: no available frame buffers to receive into");
                 continue 'drain_readiness_loop;
             }
-
-            log::trace!("frame bufmut_vec length: {}", frame_bufmut_vec.len());
             
             let t = Instant::now();
             let result = recv_from(&mut frame_bufmut_vec, recv_sk, &mut packet_batch, &exit);
@@ -154,10 +152,8 @@ where
 
             match result {
                 Ok(len) => {
-                    log::trace!("recv_from got {} packets in {:?}", len, recv_interval);
                     if len > 0 {
                         // observe_recv_interval(recv_interval.as_micros() as f64);
-                        log::trace!("Received {} packets", len);
                         inc_packets_received(len as u64);
                         observe_recv_packet_count(len as f64);
                         let StreamerReceiveStats {
@@ -180,7 +176,7 @@ where
                             let dest_idx = match router.route_packet(&packet, packet_tx_vec.len()) {
                                 Some(idx) => idx,
                                 None => {
-                                    log::debug!("Failed to route packet {:?}", packet);
+                                    log::trace!("Failed to route packet {:?}", packet);
                                     let trashed_frame_bufmut = packet.buffer.into_inner().as_mut_buf();
                                     frame_bufmut_vec.push(trashed_frame_bufmut);
                                     continue 'packet_drain;
@@ -229,16 +225,13 @@ pub fn recv_from(
     //  * read until it fails
     //  * set it back to blocking before returning
     // socket.set_nonblocking(false)?;
-    trace!("receiving on {}", socket.local_addr().unwrap());
     let batch_capacity = batch.capacity();
     assert!(batch_capacity >= PACKETS_PER_BATCH);
 
     let mut i = 0;
 
     while !exit.load(Ordering::Relaxed) {
-        log::trace!("Preparing to receive packets, currently have {} packets", i);
         let npkts = triton_recv_mmsg(socket, available_frame_buf_vec, batch)?;
-        trace!("got {} packets", npkts);
         i += npkts;
         if available_frame_buf_vec.is_empty() {
             break;
@@ -289,7 +282,6 @@ pub fn triton_recv_mmsg(
     // Should never hit this, but bail if the caller didn't provide any Packets
     // to receive into
     if fill_buffers.is_empty() {
-        log::trace!("triton_recv_mmsg: no fill buffers to receive into");
         return Ok(0);
     }
     // Assert that there are no leftovers in packets.
@@ -301,10 +293,6 @@ pub fn triton_recv_mmsg(
     let remaining_packets = packets.capacity() - packets.len();
     let sock_fd = sock.as_raw_fd();
     let count = cmp::min(iovs.len(), remaining_packets).min(fill_buffers.len());
-    log::trace!(
-        "triton_recv_mmsg: preparing to receive up to {} packets",
-        count
-    );
     let mut frame_buffer_inflight_vec: [MaybeUninit<FrameBufMut>; NUM_RCVMMSGS] =
         std::array::from_fn(|_| MaybeUninit::uninit());
 
@@ -338,7 +326,6 @@ pub fn triton_recv_mmsg(
         tv_nsec: 0,
     };
     // TODO: remove .try_into().unwrap() once rust libc fixes recvmmsg types for musl 
-    log::trace!("Calling recvmmsg with count={}", count);
     #[allow(clippy::useless_conversion)]
     let nrecv = unsafe {
         libc::recvmmsg(
@@ -349,7 +336,6 @@ pub fn triton_recv_mmsg(
             &mut ts,
         )
     };
-    log::trace!("recvmmsg returned nrecv={}", nrecv);
     let nrecv = if nrecv < 0 {
         // On error, return all in-flight frame buffers back to the caller
         for i in 0..frame_buffer_inflight_cnt {

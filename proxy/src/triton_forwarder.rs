@@ -207,7 +207,7 @@ fn packet_fwd_tile(
                     );
                     next_deduper_reset_attempt = Instant::now() + Duration::from_secs(2);
                     // show stats here...
-                    log::trace!(
+                    log::debug!(
                         "send_batch_count: {}, duplicate: {}, total-pkt-sent: {}, queue-len: {}, to-recycle: {}", 
                         stats.send_batch_count.load(Ordering::Relaxed), 
                         stats.duplicate.load(Ordering::Relaxed),
@@ -274,6 +274,10 @@ fn packet_fwd_tile(
                     recycled_frames.push(desc);
 
                     for dest in dests.iter() {
+                        let origin = packet.meta.socket_addr().ip();
+                        if origin == dest.ip() {
+                            continue;
+                        }
                         // Cheap to do since we are just copying a pointer
                         let buf_clone = unsafe { buf.unsafe_subslice_clone(0, packet.meta.size) };
                         next_batch_send.push((buf_clone, *dest));
@@ -565,12 +569,12 @@ pub fn run_proxy_system<R>(
             recv_pkt_vec.push(multicast_sk_vec[pkt_recv_idx].try_clone().expect("multicast sk clone"));
         }
 
-        if let Some(doublezero_sk) = doublezero_v4_sk_vec.get(pkt_recv_idx) {
-            recv_pkt_vec.push(doublezero_sk.try_clone().expect("doublezero v4 sk clone"));
+        if let Some(doublezero_v4_sk) = doublezero_v4_sk_vec.get(pkt_recv_idx) {
+            recv_pkt_vec.push(doublezero_v4_sk.try_clone().expect("doublezero v4 sk clone"));
         }
 
-        if let Some(doublezero_sk) = doublezero_v6_sk_vec.get(pkt_recv_idx) {
-            recv_pkt_vec.push(doublezero_sk.try_clone().expect("doublezero v6 sk clone"));
+        if let Some(doublezero_v6_sk) = doublezero_v6_sk_vec.get(pkt_recv_idx) {
+            recv_pkt_vec.push(doublezero_v6_sk.try_clone().expect("doublezero v6 sk clone"));
         }
 
         let exit = Arc::clone(&exit);
@@ -600,22 +604,7 @@ pub fn run_proxy_system<R>(
     drop(fill_tx_vec);
     drop(packet_tx_vec);
     log::info!("Waiting for {} tile threads to exit", tile_thread_vec.len());
-
-
-    // There is a special case where pkt_recv could be blocked inside recvmmsg syscall if no new packets arrive in a triton_recv_msg iteratoin (when newly set to blocking mode).
-    // We have to force close the socket to break it out of the syscall.
-    // for sk_fd in pkt_recv_sk_raw_fd_vec {
-    //     unsafe {
-    //         libc::close(sk_fd);
-    //     }
-    // }
-
-    // for sk_fd in pkt_fwd_sk_raw_fd_vec {
-    //     unsafe {
-    //         libc::close(sk_fd);
-    //     }
-    // }
-
+    
     for th in tile_thread_vec {
         let result = th.join();
         if let Err(e) = result {
@@ -623,9 +612,6 @@ pub fn run_proxy_system<R>(
         }
     }
 }
-
-
-
 
 /// Reset dedup + send metrics to influx
 pub fn start_forwarder_accessory_thread(
