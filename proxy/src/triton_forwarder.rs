@@ -85,7 +85,7 @@ impl Default for PktRecvTileMemConfig {
 
 fn packet_recv_tile<R>(
     pkt_recv_idx: usize,
-    pkt_recv_socket: UdpSocket,
+    pkt_recv_socket_vec: Vec<UdpSocket>,
     exit: Arc<AtomicBool>,
     forwarder_stats: Arc<StreamerReceiveStats>,
     mut fill_rx: Rx<FrameDesc>,
@@ -100,10 +100,9 @@ where
         .name(format!("ssListen{pkt_recv_idx}"))
         .spawn(move || {
             crate::recv_mmsg::recv_loop(
-                &pkt_recv_socket,
+                pkt_recv_socket_vec,
                 &exit,
                 &forwarder_stats,
-                Duration::default(),
                 &mut fill_rx,
                 &packet_tx_vec,
                 packet_router,
@@ -364,27 +363,36 @@ pub fn run_proxy_system<R>(
 {
     let mut tile_thread_vec: Vec<JoinHandle<()>> = Vec::new();
     // Build pkt_recv sockets
-    let pkt_recv_sk_vec = if let Some(multicast_config) = multticast_config {
+    let pkt_recv_multicast_sk_vec = if let Some(multicast_config) = multticast_config {
         log::info!("Using Triton multicast configuration for pkt_recv tiles");
-        crate::triton_multicast_config::create_multicast_sockets_triton(
+        let vec = crate::triton_multicast_config::create_multicast_sockets_triton(
             &multicast_config, 
             NonZeroUsize::new(num_pkt_recv_tiles).expect("num_pkt_recv_tiles must be non-zero"),
-            src_ip,
-            src_port,
-        ).expect("multicast-config")
+        ).expect("multicast-config");
+        Some(vec)
     } else {
-        let (_port, pkt_recv_sk_vec) = solana_net_utils::multi_bind_in_range_with_config(
-            src_ip,
-            (src_port, src_port + 1),
-            SocketConfig::default().reuseport(true),
-            num_pkt_recv_tiles,
-        )
-        .unwrap_or_else(|_| {
-            panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
-        });
-        pkt_recv_sk_vec
+        None
     };
+    let (_port, pkt_recv_sk_vec) = solana_net_utils::multi_bind_in_range_with_config(
+        src_ip,
+        (src_port, src_port + 1),
+        SocketConfig::default().reuseport(true),
+        num_pkt_recv_tiles,
+    )
+    .unwrap_or_else(|_| {
+        panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
+    });
     assert!(pkt_recv_sk_vec.len() == num_pkt_recv_tiles, "pkt_recv_sk_vec.len() ({}) != num_pkt_recv_tiles ({})", pkt_recv_sk_vec.len(), num_pkt_recv_tiles);
+
+    if let Some(multicast_sk_vec) = &pkt_recv_multicast_sk_vec {
+        assert!(multicast_sk_vec.len() == num_pkt_recv_tiles, "multicast_sk_vec.len() ({}) != num_pkt_recv_tiles ({})", multicast_sk_vec.len(), num_pkt_recv_tiles);
+    }
+
+    // Make sure socket are set to nonblocking
+    for sk in &pkt_recv_sk_vec {
+        sk.set_nonblocking(true).expect("pkt_recv_sk nonblocking");
+    }
+
 
     let mut pkt_recv_sk_raw_fd_vec: Vec<i32> = Vec::with_capacity(num_pkt_recv_tiles);
     for sk in &pkt_recv_sk_vec {
@@ -541,13 +549,23 @@ pub fn run_proxy_system<R>(
         pkt_recv_sk_vec.into_iter(),
         fill_rx_vec.into_iter()
     ) {
+
+        let mut recv_pkt_vec = vec![
+            pkt_recv_sk
+        ];
+
+        if let Some(multicast_sk_vec) = &pkt_recv_multicast_sk_vec {
+            recv_pkt_vec.push(multicast_sk_vec[pkt_recv_idx].try_clone().expect("multicast sk clone"));
+        }
+
+
         let exit = Arc::clone(&exit);
         let forwarder_stats = Arc::clone(&pk_recv_stats);
         let packet_tx_vec_clone = packet_tx_vec.clone();
         let pkt_router_clone = pkt_router.clone();
         let jh = packet_recv_tile(
             pkt_recv_idx,
-            pkt_recv_sk,
+            recv_pkt_vec,
             exit,
             forwarder_stats,
             fill_rx,
@@ -572,17 +590,17 @@ pub fn run_proxy_system<R>(
 
     // There is a special case where pkt_recv could be blocked inside recvmmsg syscall if no new packets arrive in a triton_recv_msg iteratoin (when newly set to blocking mode).
     // We have to force close the socket to break it out of the syscall.
-    for sk_fd in pkt_recv_sk_raw_fd_vec {
-        unsafe {
-            libc::close(sk_fd);
-        }
-    }
+    // for sk_fd in pkt_recv_sk_raw_fd_vec {
+    //     unsafe {
+    //         libc::close(sk_fd);
+    //     }
+    // }
 
-    for sk_fd in pkt_fwd_sk_raw_fd_vec {
-        unsafe {
-            libc::close(sk_fd);
-        }
-    }
+    // for sk_fd in pkt_fwd_sk_raw_fd_vec {
+    //     unsafe {
+    //         libc::close(sk_fd);
+    //     }
+    // }
 
     for th in tile_thread_vec {
         let result = th.join();

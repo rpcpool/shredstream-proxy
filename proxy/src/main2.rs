@@ -86,6 +86,21 @@ struct CommonArgs {
     #[arg(long, env, default_value_t = 20_000)]
     src_bind_port: u16,
 
+    /// Multicast IP to listen for shreds. If none provided, attempts to
+    /// parse multicast routes for the device specified by `--multicast-device`
+    /// via `ip --json route show dev <device>`.
+    #[arg(long, env)]
+    multicast_bind_ip: Option<IpAddr>,
+
+    /// Network device to use for multicast route discovery and interface selection.
+    /// Example: `eth0`, `en0`, or `doublezero1`.
+    #[arg(long, env, default_value = "doublezero1")]
+    multicast_device: String,
+
+    /// Port to receive multicast shreds
+    #[arg(long, env, default_value_t = 20001)]
+    multicast_subscribe_port: u16,
+
     /// Static set of IP:Port where Shredstream proxy forwards shreds to, comma separated.
     /// Eg. `127.0.0.1:8001,10.0.0.1:8001`.
     // Note: store the original string, so we can do hostname resolution when refreshing destinations
@@ -130,8 +145,13 @@ struct CommonArgs {
     /// If ipv4, then optional (listen on all interfaces if not provided).
     #[arg(long, env)]
     triton_multicast_bind_interface: Option<String>,
-    #[arg(long, env, default_value_t = 1)]
-    triton_multicast_num_threads: usize,
+
+    ///
+    /// The port to listen on for triton multicast.
+    /// If not provided, defaults to 8002.
+    /// NOTE: this port must match the port used by the triton multicast sender.
+    #[arg(long, env)]
+    triton_multicast_port: Option<u16>,
 
     /// Address to bind prometheus metrics server to. If not provided, prometheus server is disabled.
     #[arg(long, env)]
@@ -301,6 +321,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
                     Some(TritonMulticastConfig::Ipv4(TritonMulticastConfigV4 {
                         multicast_ip: ipv4,
                         bind_ifname: args.triton_multicast_bind_interface,
+                        listen_port: args.triton_multicast_port.unwrap_or(8002),
                     }))
                 }
                 IpAddr::V6(ipv6) => {
@@ -313,6 +334,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
                                     "triton-multicast-bind-interface is required for IPv6",
                                 )
                             })?,
+                        listen_port: args.triton_multicast_port.unwrap_or(8002),
                     }))
                 }
             }
