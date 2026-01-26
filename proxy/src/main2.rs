@@ -20,7 +20,7 @@ use tokio::runtime::Runtime;
 use tonic::Status;
 
 use crate::{
-    forwarder::ShredMetrics, triton_multicast_config::{TritonMulticastConfig, TritonMulticastConfigV4, TritonMulticastConfigV6, create_multicast_sockets_triton}, recv_mmsg::FECSetRoutingStrategy, token_authenticator::BlockEngineConnectionError, triton_forwarder::PktRecvTileMemConfig,
+    forwarder::ShredMetrics, recv_mmsg::FECSetRoutingStrategy, token_authenticator::BlockEngineConnectionError, triton_forwarder::PktRecvTileMemConfig, triton_multicast_config::{TritonMulticastConfig, TritonMulticastConfigV4, TritonMulticastConfigV6, create_multicast_socket_on_device, create_multicast_sockets_triton}
 };
 pub mod deshred;
 pub mod forwarder;
@@ -248,13 +248,22 @@ fn main() -> Result<(), ShredstreamProxyError> {
     let prom_registry  = prometheus::Registry::new();
     prom::register_metrics(&prom_registry);
     let all_args: Args = Args::parse();
-
     let shredstream_args = all_args.shredstream_args.clone();
     // common args
     let args = match all_args.shredstream_args {
         ProxySubcommands::Shredstream(x) => x.common_args,
         ProxySubcommands::ForwardOnly(x) => x,
     };
+
+
+    let num_pkt_recv_tiles = args.num_pkt_recv_tile
+        .map(|x| x.get())
+        .unwrap_or(args.num_threads.unwrap_or(1));
+
+    let num_pkt_fwd_tiles = args.num_pkt_fwd_tile
+        .map(|x| x.get())
+        .unwrap_or(args.num_threads.unwrap_or(1));
+
     set_host_id(hostname::get()?.into_string().unwrap());
     if (args.endpoint_discovery_url.is_none() && args.discovered_endpoints_port.is_some())
         || (args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_none())
@@ -313,6 +322,14 @@ fn main() -> Result<(), ShredstreamProxyError> {
     let use_discovery_service =
         args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
 
+    let (doublezero_v4_sk_vec, doublezero_v6_sk_vec) = create_multicast_socket_on_device(
+        &args.multicast_device,
+        args.multicast_subscribe_port,
+        args.multicast_bind_ip,
+        num_pkt_recv_tiles,
+    )?;
+
+
     let maybe_triton_multicast_config = match args.triton_multicast_group {
         Some(multicast_group) => {
             log::info!("Using triton multicast group: {}", multicast_group);
@@ -361,12 +378,14 @@ fn main() -> Result<(), ShredstreamProxyError> {
                 maybe_triton_multicast_config,
                 args.src_bind_addr,
                 args.src_bind_port,
-                args.num_pkt_recv_tile.map(|x| x.get()).unwrap_or(1),
-                args.num_pkt_fwd_tile.map(|x| x.get()).unwrap_or(1),
+                num_pkt_recv_tiles,
+                num_pkt_fwd_tiles,
                 FECSetRoutingStrategy,
                 exit,
                 pkt_recv_stats,
                 pkt_fwd_stats,
+                doublezero_v4_sk_vec,
+                doublezero_v6_sk_vec,
             );
         })
         .expect("tritonProxyMain")

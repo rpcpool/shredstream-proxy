@@ -346,6 +346,7 @@ fn packet_fwd_tile(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_proxy_system<R>(
     pkt_recv_tile_mem_config: PktRecvTileMemConfig,
     dest_addr_vec: Arc<ArcSwap<Vec<SocketAddr>>>,
@@ -358,6 +359,8 @@ pub fn run_proxy_system<R>(
     exit: Arc<AtomicBool>,
     pk_recv_stats: Arc<StreamerReceiveStats>,
     pk_fwd_stats: Arc<ShredMetrics>,
+    doublezero_v4_sk_vec: Vec<UdpSocket>,
+    doublezero_v6_sk_vec: Vec<UdpSocket>,
 ) where
     R: PacketRoutingStrategy + Send + Sync + 'static,
 {
@@ -373,6 +376,10 @@ pub fn run_proxy_system<R>(
     } else {
         None
     };
+
+    assert!(doublezero_v4_sk_vec.len() <= num_pkt_recv_tiles, "doublezero_v4_sk_vec.len() ({}) > num_pkt_recv_tiles ({})", doublezero_v4_sk_vec.len(), num_pkt_recv_tiles);
+    assert!(doublezero_v6_sk_vec.len() <= num_pkt_recv_tiles, "doublezero_v6_sk_vec.len() ({}) > num_pkt_recv_tiles ({})", doublezero_v6_sk_vec.len(), num_pkt_recv_tiles);
+
     let (_port, pkt_recv_sk_vec) = solana_net_utils::multi_bind_in_range_with_config(
         src_ip,
         (src_port, src_port + 1),
@@ -558,6 +565,13 @@ pub fn run_proxy_system<R>(
             recv_pkt_vec.push(multicast_sk_vec[pkt_recv_idx].try_clone().expect("multicast sk clone"));
         }
 
+        if let Some(doublezero_sk) = doublezero_v4_sk_vec.get(pkt_recv_idx) {
+            recv_pkt_vec.push(doublezero_sk.try_clone().expect("doublezero v4 sk clone"));
+        }
+
+        if let Some(doublezero_sk) = doublezero_v6_sk_vec.get(pkt_recv_idx) {
+            recv_pkt_vec.push(doublezero_sk.try_clone().expect("doublezero v6 sk clone"));
+        }
 
         let exit = Arc::clone(&exit);
         let forwarder_stats = Arc::clone(&pk_recv_stats);

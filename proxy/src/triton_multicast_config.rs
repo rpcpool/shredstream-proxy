@@ -2,6 +2,8 @@ use std::{
     io, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket}, num::NonZeroUsize, process::Command
 };
 
+use itertools::{Itertools, Either};
+use log::{debug, warn, info};
 use serde::Deserialize;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -109,6 +111,114 @@ pub fn parse_ifindex_from_ip_link_show_json(bytes: &[u8]) -> io::Result<Option<u
     Ok(rows.into_iter().last().and_then(|r| r.ifindex))
 }
 
+
+/// Creates one UDP socket bound on `multicast_port` and joins applicable multicast groups.
+/// If `multicast_ip` is provided, join just that group, otherwise parse `ip route list` for
+/// entries on `device_name` and join all multicast groups found.
+pub fn create_multicast_socket_on_device(
+    device_name: &str,
+    multicast_port: u16,
+    multicast_ip: Option<IpAddr>,
+    num_threads: usize,
+) -> std::io::Result<(Vec<UdpSocket>, Vec<UdpSocket>)> {
+    let device_ipv4 = ipv4_addr_for_device(device_name).unwrap_or_else(|e| {
+        debug!("Failed to resolve IPv4 address for device {device_name}: {e}");
+        None
+    });
+    let device_ifindex_v6 = ifindex_for_device(device_name).unwrap_or_else(|e| {
+        debug!("Failed to resolve ifindex for device {device_name}: {e}");
+        None
+    });
+
+    let mut multicast_groups: Vec<IpAddr> = Vec::new();
+    let (groups_v4, groups_v6): (Vec<Ipv4Addr>, Vec<Ipv6Addr>) = match multicast_ip {
+        Some(IpAddr::V4(g)) => (vec![g], Vec::new()),
+        Some(IpAddr::V6(g6)) => (Vec::new(), vec![g6]),
+        None => match get_ip_route_for_device(device_name) {
+            Ok(ips) => ips.into_iter().partition_map(|ip| match ip {
+                IpAddr::V4(v4) => Either::Left(v4),
+                IpAddr::V6(v6) => Either::Right(v6),
+            }),
+            Err(e) => {
+                debug!("Failed to parse 'ip route list' for {device_name}: {e}");
+                (Vec::new(), Vec::new())
+            }
+        },
+    };
+
+    multicast_groups.extend(groups_v4.iter().map(|ipv4| IpAddr::V4(*ipv4)));
+    multicast_groups.extend(groups_v6.iter().map(|ipv6| IpAddr::V6(*ipv6)));
+
+    if groups_v4.is_empty() && groups_v6.is_empty() {
+        debug!("No multicast groups found for device {device_name}; skipping multicast listener");
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut sockets_v4: Vec<UdpSocket> = Vec::new();
+    if !groups_v4.is_empty() {
+        let addr_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), multicast_port);
+
+        let first_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        first_socket.set_reuse_address(true)?;
+        first_socket.set_reuse_port(true)?;
+        first_socket.set_nonblocking(true)?;
+        first_socket.bind(&SockAddr::from(addr_v4))?;
+        let actual_socket_addr = first_socket.local_addr()?;
+
+        for g in &groups_v4 {
+            first_socket.join_multicast_v4(g, &device_ipv4.unwrap_or(Ipv4Addr::UNSPECIFIED))?;
+            info!("Joined IPv4 multicast group {g} port {multicast_port}");
+        }
+        sockets_v4.push(first_socket.into());
+
+        // Create N-1 additional sockets on the same port for load balancing
+        for _ in 1..num_threads {
+            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+            socket.set_reuse_address(true)?;
+            socket.set_reuse_port(true)?;
+            socket.bind(&actual_socket_addr)?;
+            socket.set_nonblocking(true)?;
+            for g in &groups_v4 {
+                socket.join_multicast_v4(g, &device_ipv4.unwrap_or(Ipv4Addr::UNSPECIFIED))?;
+            }
+            sockets_v4.push(socket.into());
+        }
+    }
+
+    let mut sockets_v6: Vec<UdpSocket> = Vec::new();
+    if !groups_v6.is_empty() {
+        let addr_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), multicast_port);
+
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_only_v6(true)?;            // IPv6-only
+        socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&SockAddr::from(addr_v6))?;
+        let actual_socket_addr = socket.local_addr()?;
+        for g in &groups_v6 {
+            socket.join_multicast_v6(g, device_ifindex_v6.unwrap_or(0))?;
+            info!("Joined IPv6 multicast group {g} port {multicast_port}");
+        }
+        sockets_v6.push(socket.into());
+
+        // Create N-1 additional sockets on the same port for load balancing
+        for _ in 1..num_threads {
+            let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+            socket.set_only_v6(true)?;
+            socket.set_reuse_address(true)?;
+            socket.set_reuse_port(true)?;
+            socket.bind(&actual_socket_addr)?;
+            socket.set_nonblocking(true)?;
+            for g in &groups_v6 {
+                socket.join_multicast_v6(g, device_ifindex_v6.unwrap_or(0))?;
+            }
+            sockets_v6.push(socket.into());
+        }
+    }
+
+    Ok((sockets_v4, sockets_v6))
+}
 
 pub struct TritonMulticastConfigV4 {
     pub multicast_ip: Ipv4Addr,
