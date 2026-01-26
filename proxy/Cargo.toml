@@ -7,7 +7,7 @@ homepage = { workspace = true }
 edition = { workspace = true }
 
 [[bin]]
-name = "triton-proxy"
+name = "triton-shredproxy"
 path = "src/main2.rs"
 
 [[bin]]
