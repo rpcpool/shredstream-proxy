@@ -26,7 +26,7 @@ lazy_static::lazy_static! {
 
     static ref RECV_PACKET_COUNT_HIST: Histogram = Histogram::with_opts(
         HistogramOpts::new("shredstream_recv_packet_count", "Number of packets in incoming batch (before dedup)")
-            .buckets(vec![1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 64.0, 100.0])
+            .buckets(vec![1.0, 5.0, 10.0, 20.0, 50.0, 64.0])
     ).unwrap();
 
     static ref PACKETS_RECEIVED_TOTAL: Counter = Counter::new(

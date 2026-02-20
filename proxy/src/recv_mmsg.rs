@@ -230,7 +230,14 @@ pub fn recv_from(
     let mut i = 0;
 
     while !exit.load(Ordering::Relaxed) {
-        let npkts = triton_recv_mmsg(socket, available_frame_buf_vec, batch)?;
+        let npkts = match triton_recv_mmsg(socket, available_frame_buf_vec, batch) {
+            Ok(npkts) => npkts,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // Drain complete for now. Preserve packets already received in this call.
+                return Ok(i);
+            }
+            Err(e) => return Err(e),
+        };
         i += npkts;
         if available_frame_buf_vec.is_empty() {
             break;
@@ -285,7 +292,6 @@ pub fn triton_recv_mmsg(
     }
     // Assert that there are no leftovers in packets.
     const SOCKADDR_STORAGE_SIZE: socklen_t = mem::size_of::<sockaddr_storage>() as socklen_t;
-
     let mut iovs = [MaybeUninit::uninit(); NUM_RCVMMSGS];
     let mut addrs = [MaybeUninit::zeroed(); NUM_RCVMMSGS];
     let mut hdrs = [MaybeUninit::uninit(); NUM_RCVMMSGS];
@@ -350,6 +356,8 @@ pub fn triton_recv_mmsg(
     } else {
         usize::try_from(nrecv).unwrap()
     };
+
+
     for idx in 0..nrecv {
         // SAFETY: `nrecv <= count` and we initialized `count` entries in `hdrs`.
         let hdr_ref = unsafe { hdrs[idx].assume_init_ref() };
@@ -369,11 +377,14 @@ pub fn triton_recv_mmsg(
         packets.push(pkt);
     }
 
-    // Return submitted buffers that were not filled by this syscall.
-    for in_flight in frame_buffer_inflight_vec
-        .iter_mut()
-        .take(frame_buffer_inflight_cnt)
-        .skip(nrecv)
+    if nrecv != count {
+        log::debug!(
+            "triton_recv_mmsg: recvd {nrecv} packets, expected up to {count}. Remaining fill buffers returned to caller."
+        ); 
+    }
+
+    // // Return submitted buffers that were not filled by this syscall.
+    for in_flight in &mut frame_buffer_inflight_vec[nrecv..count]
     {
         let buffer = unsafe { in_flight.assume_init_read() };
         fill_buffers.push(buffer);
