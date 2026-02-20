@@ -147,10 +147,7 @@ where
                 continue 'drain_readiness_loop;
             }
             
-            let t = Instant::now();
             let result = recv_from(&mut frame_bufmut_vec, recv_sk, &mut packet_batch, &exit);
-            let recv_interval = t.elapsed();
-
 
             match result {
                 Ok(len) => {

@@ -384,20 +384,16 @@ impl<T> Tx<T> {
             let head = self.inner.head.load(Ordering::Relaxed);
             let tail = self.inner.tail.load(Ordering::Acquire);
 
-            // 2. The Fix: Calculate occupancy with wrapping awareness
-            let occupancy = head.wrapping_sub(tail);
-
-            // A ring is only full if occupancy is >= capacity.
-            // We add a check for (usize::MAX / 2) to ignore the "stale head" 
-            // cases where occupancy underflows to a massive number.
-            if occupancy >= self.inner.capacity && occupancy < (usize::MAX / 2) {
-                return Err(value); 
+            // 2. Calculate occupancy with wrapping arithmetic.
+            let used = head.wrapping_sub(tail);
+            if used == self.inner.capacity {
+                return Err(value);
             }
-
-            // if head.wrapping_sub(tail) >= self.inner.capacity {
-            //     log::error!("Ring is full: head={}, tail={}, capacity={}", head, tail, self.inner.capacity);
-            //     return Err(value); // Ring is full
-            // }
+            if used > self.inner.capacity {
+                // Inconsistent snapshot under concurrent updates; retry.
+                std::hint::spin_loop();
+                continue;
+            }
 
             // 2. Claim a slot using Compare-and-Swap (CAS).
             // We use SeqCst or AcqRel here to ensure that once we "win" this slot,
@@ -785,6 +781,30 @@ mod tests {
 
         assert!(tx.send(13).is_ok());
         assert_eq!(rx.recv(), 13);
+    }
+
+    #[test]
+    fn test_send_retries_when_used_exceeds_capacity_snapshot() {
+        let (tx, mut rx) = message_ring::<u64>(8).unwrap();
+        tx.inner.head.store(5, Ordering::Relaxed);
+        tx.inner.tail.store(10, Ordering::Relaxed); // used = 5.wrapping_sub(10) > capacity
+
+        let tx_sender = tx.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let sender = thread::spawn(move || {
+            let out = tx_sender.send(42);
+            done_tx.send(out).unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        tx.inner.tail.store(5, Ordering::Release); // restore consistent snapshot
+
+        let send_result = done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("send should complete after snapshot becomes consistent");
+        assert!(send_result.is_ok());
+        assert_eq!(rx.recv(), 42);
+        sender.join().unwrap();
     }
 
     #[test]
