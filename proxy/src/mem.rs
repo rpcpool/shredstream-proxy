@@ -92,6 +92,7 @@ impl Drop for SharedMem {
 pub struct FrameDesc {
     pub ptr: *mut u8,
     pub frame_size: usize,
+    pub shmem_idx: usize,
 }
 
 unsafe impl Send for FrameDesc {}
@@ -130,6 +131,7 @@ impl FrameBuf {
         FrameDesc {
             ptr: self.desc.ptr,
             frame_size: self.desc.frame_size,
+            shmem_idx: self.desc.shmem_idx,
         }
     }
 
@@ -140,6 +142,7 @@ impl FrameBuf {
             desc: FrameDesc {
                 ptr: self.desc.ptr,
                 frame_size: self.desc.frame_size,
+                shmem_idx: self.desc.shmem_idx,
             },
         }
     }
@@ -152,6 +155,7 @@ impl FrameBuf {
             desc: FrameDesc {
                 ptr: self.desc.ptr,
                 frame_size: self.desc.frame_size,
+                shmem_idx: self.desc.shmem_idx,
             },
         }
     }
@@ -189,6 +193,7 @@ impl FrameDesc {
             desc: FrameDesc {
                 ptr: self.ptr,
                 frame_size: self.frame_size,
+                shmem_idx: self.shmem_idx,
             },
         }
     }
@@ -590,6 +595,7 @@ mod tests {
                 .send(FrameDesc {
                     ptr: unsafe { mem.ptr.add(i * frame_size) },
                     frame_size,
+                    shmem_idx: 0,
                 })
                 .unwrap();
         }
@@ -635,6 +641,7 @@ mod tests {
         let desc = FrameDesc {
             ptr: shmem.ptr,
             frame_size,
+            shmem_idx: 0,
         };
 
         let mut buf_mut: FrameBufMut = desc.into();
@@ -660,6 +667,7 @@ mod tests {
         let desc = FrameDesc {
             ptr: shmem.ptr,
             frame_size,
+            shmem_idx: 0,
         };
 
         let mut buf_mut: FrameBufMut = desc.into();
@@ -718,6 +726,7 @@ mod tests {
         let desc = FrameDesc {
             ptr: shmem.ptr,
             frame_size,
+            shmem_idx: 0,
         };
         let mut buf_mut: FrameBufMut = desc.into();
         unsafe { buf_mut.seek(frame_size + 1) };
@@ -731,6 +740,7 @@ mod tests {
         let desc = FrameDesc {
             ptr: shmem.ptr,
             frame_size,
+            shmem_idx: 0,
         };
         let mut buf_mut: FrameBufMut = desc.into();
         unsafe { buf_mut.advance_mut(frame_size + 1) };
@@ -744,6 +754,7 @@ mod tests {
         let desc = FrameDesc {
             ptr: shmem.ptr,
             frame_size,
+            shmem_idx: 0,
         };
 
         let mut buf_mut: FrameBufMut = desc.into();

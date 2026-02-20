@@ -184,7 +184,7 @@ where
                             router_dest_dist[dest_idx] += 1;
                             let _ = &packet_tx_vec[dest_idx]
                                 .send(packet)
-                                .expect(format!("failed to send packet to {dest_idx} ring is full, distr:{:?}", router_dest_dist).as_str());
+                                .unwrap_or_else(|_packet| panic!("failed to send packet to {dest_idx} ring is full, distr:{:?}", router_dest_dist));
                         }
                     }
                 }
@@ -563,6 +563,7 @@ mod tests {
         let mut fill_buffers = vec![FrameDesc {
             ptr: shmem.ptr,
             frame_size: PACKET_DATA_SIZE,
+            shmem_idx: 0,
         }
         .as_mut_buf()];
         let mut packets = Vec::<TritonPacket>::with_capacity(NUM_RCVMMSGS);
@@ -610,11 +611,13 @@ mod tests {
             FrameDesc {
                 ptr: shmem.ptr,
                 frame_size: PACKET_DATA_SIZE,
+                shmem_idx: 0,
             }
             .as_mut_buf(),
             FrameDesc {
                 ptr: unsafe { shmem.ptr.add(PACKET_DATA_SIZE) },
                 frame_size: PACKET_DATA_SIZE,
+                shmem_idx: 0,
             }
             .as_mut_buf(),
         ];

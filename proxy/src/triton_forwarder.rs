@@ -7,7 +7,7 @@ use std::{
 use arc_swap::ArcSwap;
 use bytes::Buf;
 use crossbeam_channel::{Receiver, Sender};
-use itertools::{izip, Itertools};
+use itertools::izip;
 use libc;
 use log::{debug, error, info, warn};
 use solana_net_utils::SocketConfig;
@@ -189,12 +189,7 @@ fn packet_fwd_tile(
 
             let mut last_batch_to_send = Instant::now();
 
-            for shmem_info in &shmem_info_vec {
-                assert!(
-                    shmem_info.len.is_power_of_two(),
-                    "shmem_info.len must be a power of 2"
-                );
-            }
+            assert_eq!(fill_tx_vec.len(), shmem_info_vec.len());
 
             let mut next_deduper_reset_attempt = Instant::now() + Duration::from_secs(2);
             let mut recycled_frames: Vec<FrameDesc> = Vec::with_capacity(UIO_MAXIOV);
@@ -337,16 +332,7 @@ fn packet_fwd_tile(
 
                 // Recycle all used frames
                 while let Some(desc) = recycled_frames.pop() {
-                    let fill_ring_idx = shmem_info_vec
-                        .iter()
-                        .find_position(|shmem_info| {
-                            let p = desc.ptr as usize;
-                            let start = shmem_info.start_ptr as usize;
-                            p >= start && p < start + shmem_info.len
-                        })
-                        .expect("unknown frame desc")
-                        .0;
-                    fill_tx_vec[fill_ring_idx]
+                    fill_tx_vec[desc.shmem_idx]
                         .send(desc)
                         .expect("frame recycling");
                 }
@@ -435,7 +421,7 @@ pub fn run_proxy_system<R>(
     let mut packet_tx_vec: Vec<Tx<TritonPacket>> = Vec::with_capacity(num_pkt_fwd_tiles);
 
     // Create the shared memory regions for recv tiles
-    for _ in 0..num_pkt_recv_tiles {
+    for shmem_idx in 0..num_pkt_recv_tiles {
         assert!(
             num_frames.is_power_of_two(),
             "num_frames must be a power of 2"
@@ -466,6 +452,7 @@ pub fn run_proxy_system<R>(
             let frame_desc = FrameDesc {
                 ptr: unsafe { shmem.ptr.add(i * frame_size) },
                 frame_size: frame_size,
+                shmem_idx,
             };
             fill_tx
                 .send(frame_desc)
@@ -719,6 +706,7 @@ mod tests {
         let frame_desc = FrameDesc {
             ptr: shmem.ptr,
             frame_size,
+            shmem_idx: 0,
         };
 
         let mut frame_bufmut = frame_desc.as_mut_buf();
