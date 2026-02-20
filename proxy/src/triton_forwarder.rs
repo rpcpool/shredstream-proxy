@@ -256,6 +256,12 @@ fn packet_fwd_tile(
 
                 let dests = hot_dest_vec.load();
                 let dests_len = dests.len();
+                assert!(
+                    dests_len <= UIO_MAXIOV,
+                    "number of destinations ({}) cannot be greater than UIO_MAXIOV ({})",
+                    dests_len,
+                    UIO_MAXIOV
+                );
                 // Fill up the next_batch_send
                 'fill_batch_send: while next_batch_send.len() < UIO_MAXIOV
                     && queued.len() > 0
@@ -368,6 +374,8 @@ pub fn run_proxy_system<R>(
 ) where
     R: PacketRoutingStrategy + Send + Sync + 'static,
 {
+    assert!(num_pkt_recv_tiles > 0, "num_pkt_recv_tiles must be > 0");
+    assert!(num_pkt_fwd_tiles > 0, "num_pkt_fwd_tiles must be > 0");
     let mut tile_thread_vec: Vec<JoinHandle<()>> = Vec::new();
     // Build pkt_recv sockets
     let pkt_recv_multicast_sk_vec = if let Some(multicast_config) = multticast_config {
@@ -643,227 +651,129 @@ pub fn start_forwarder_accessory_thread(
         .unwrap()
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use std::{
-//         net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
-//         str::FromStr,
-//         sync::{Arc, Mutex, RwLock},
-//         thread,
-//         thread::sleep,
-//         time::Duration,
-//     };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BufMut;
+    use solana_sdk::packet::PACKET_DATA_SIZE;
+    use std::net::UdpSocket;
 
-//     use solana_perf::{
-//         deduper::Deduper,
-//         packet::{Meta, Packet, PacketBatch},
-//     };
-//     use solana_sdk::packet::{PacketFlags, PACKET_DATA_SIZE};
+    #[test]
+    fn test_pkt_recv_mem_sizing_from_str_aliases() {
+        assert!(matches!(
+            PktRecvMemSizing::from_str("xs"),
+            Ok(PktRecvMemSizing::XSmall)
+        ));
+        assert!(matches!(
+            PktRecvMemSizing::from_str("medium"),
+            Ok(PktRecvMemSizing::Medium)
+        ));
+        assert!(matches!(
+            PktRecvMemSizing::from_str("2xl"),
+            Ok(PktRecvMemSizing::XXLarge)
+        ));
+        assert!(matches!(
+            PktRecvMemSizing::from_str("5XL"),
+            Ok(PktRecvMemSizing::XXXXXLarge)
+        ));
+    }
 
-//     fn listen_and_collect(listen_socket: UdpSocket, received_packets: Arc<Mutex<Vec<Vec<u8>>>>) {
-//         let mut buf = [0u8; PACKET_DATA_SIZE];
-//         loop {
-//             listen_socket.recv(&mut buf).unwrap();
-//             received_packets.lock().unwrap().push(Vec::from(buf));
-//         }
-//     }
+    #[test]
+    fn test_pkt_recv_mem_sizing_from_str_invalid() {
+        let invalid = "huge";
+        let err = PktRecvMemSizing::from_str(invalid).unwrap_err();
+        assert_eq!(err, invalid);
+    }
 
-//     #[test]
-//     fn test_2shreds_3destinations() {
-//         let packet_batch = PacketBatch::new(vec![
-//             Packet::new(
-//                 [1; PACKET_DATA_SIZE],
-//                 Meta {
-//                     size: PACKET_DATA_SIZE,
-//                     addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-//                     port: 48289, // received on random port
-//                     flags: PacketFlags::empty(),
-//                 },
-//             ),
-//             Packet::new(
-//                 [2; PACKET_DATA_SIZE],
-//                 Meta {
-//                     size: PACKET_DATA_SIZE,
-//                     addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-//                     port: 9999,
-//                     flags: PacketFlags::empty(),
-//                 },
-//             ),
-//         ]);
-//         let (packet_sender, packet_receiver) = crossbeam_channel::unbounded::<PacketBatch>();
-//         packet_sender.send(packet_batch).unwrap();
+    #[test]
+    fn test_pkt_recv_tile_mem_config_default() {
+        let cfg = PktRecvTileMemConfig::default();
+        assert_eq!(cfg.frame_size, 2048);
+        assert!(matches!(cfg.memory_size, PktRecvMemSizing::XSmall));
+        assert!(!cfg.hugepage);
+    }
 
-//         let dest_socketaddrs = vec![
-//             SocketAddr::from_str("0.0.0.0:32881").unwrap(),
-//             SocketAddr::from_str("0.0.0.0:33881").unwrap(),
-//             SocketAddr::from_str("0.0.0.0:34881").unwrap(),
-//         ];
+    #[test]
+    fn test_tile_wait_group_wait_first_reports_drop() {
+        let wait_group = TileWaitGroup::new();
+        let sig = wait_group.get_tile_closed_signal(TileKind::PktFwd, 7);
+        drop(sig);
+        let (kind, idx) = wait_group.wait_first();
+        assert_eq!(kind, TileKind::PktFwd);
+        assert_eq!(idx, 7);
+    }
 
-//         let test_listeners = dest_socketaddrs
-//             .iter()
-//             .map(|socketaddr| {
-//                 (
-//                     UdpSocket::bind(socketaddr).unwrap(),
-//                     *socketaddr,
-//                     // store results in vec of packet, where packet is Vec<u8>
-//                     Arc::new(Mutex::new(vec![])),
-//                 )
-//             })
-//             .collect::<Vec<_>>();
+    #[test]
+    fn test_packet_fwd_tile_sends_and_recycles_frame() {
+        let frame_size = 2048usize;
+        let listener = UdpSocket::bind("127.0.0.1:0").expect("listener bind");
+        listener
+            .set_read_timeout(Some(Duration::from_millis(1000)))
+            .expect("listener set_read_timeout");
+        let listener_addr = listener.local_addr().expect("listener local_addr");
 
-//         let udp_sender = UdpSocket::bind("0.0.0.0:10000").unwrap();
+        let send_socket = UdpSocket::bind("0.0.0.0:0").expect("send bind");
+        let hot_dest_vec = Arc::new(ArcSwap::from_pointee(vec![listener_addr]));
 
-//         // spawn listeners
-//         test_listeners
-//             .iter()
-//             .for_each(|(listen_socket, _socketaddr, to_receive)| {
-//                 let socket = listen_socket.try_clone().unwrap();
-//                 let to_receive = to_receive.to_owned();
-//                 thread::spawn(move || listen_and_collect(socket, to_receive));
-//             });
+        let shmem = SharedMem::new(frame_size, 1, false).expect("shmem");
+        let frame_desc = FrameDesc {
+            ptr: shmem.ptr,
+            frame_size,
+        };
 
-//         // send packets
-//         recv_from_channel_and_send_multiple_dest(
-//             packet_receiver.recv(),
-//             &Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
-//                 &mut rand::thread_rng(),
-//                 crate::forwarder::DEDUPER_NUM_BITS,
-//             ))),
-//             &udp_sender,
-//             &Arc::new(dest_socketaddrs),
-//             accept_all,
-//             true,
-//             &Arc::new(ShredMetrics::default()),
-//         )
-//         .unwrap();
+        let mut frame_bufmut = frame_desc.as_mut_buf();
+        let payload = b"hello-forwarder";
+        frame_bufmut.put_slice(payload);
+        let frame_buf: FrameBuf = frame_bufmut.into();
 
-//         // allow packets to be received
-//         sleep(Duration::from_millis(500));
+        let mut packet = TritonPacket::new(frame_buf);
+        packet.meta_mut().size = payload.len();
+        // Use a non-local origin so the destination filter doesn't skip forwarding.
+        packet
+            .meta_mut()
+            .set_socket_addr(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)), 12345));
 
-//         let received = test_listeners
-//             .iter()
-//             .map(|(_, _, results)| results.clone())
-//             .collect::<Vec<_>>();
+        let (fill_tx, mut fill_rx) = crate::mem::message_ring::<FrameDesc>(8).expect("fill ring");
+        let (packet_tx, packet_rx) =
+            crate::mem::message_ring::<TritonPacket>(8).expect("packet ring");
 
-//         // check results
-//         for received in received.iter() {
-//             let received = received.lock().unwrap();
-//             assert_eq!(received.len(), 2);
-//             assert!(received
-//                 .iter()
-//                 .all(|packet| packet.len() == PACKET_DATA_SIZE));
-//             assert_eq!(received[0], [1; PACKET_DATA_SIZE]);
-//             assert_eq!(received[1], [2; PACKET_DATA_SIZE]);
-//         }
+        let shmem_info_vec = vec![SharedMemInfo {
+            start_ptr: shmem.ptr,
+            len: shmem.len(),
+        }];
+        let fill_tx_vec = vec![fill_tx];
 
-//         assert_eq!(
-//             received
-//                 .iter()
-//                 .fold(0, |acc, elem| acc + elem.lock().unwrap().len()),
-//             6
-//         );
-//     }
+        let wait_group = TileWaitGroup::new();
+        let exit = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(ShredMetrics::default());
+        let jh = packet_fwd_tile(
+            0,
+            hot_dest_vec,
+            send_socket,
+            packet_rx,
+            fill_tx_vec,
+            shmem_info_vec,
+            stats,
+            Arc::clone(&exit),
+            wait_group.get_tile_closed_signal(TileKind::PktFwd, 0),
+        )
+        .expect("spawn packet_fwd_tile");
 
-//     #[test]
-//     fn test_dest_filter() {
-//         let packet_batch = PacketBatch::new(vec![
-//             Packet::new(
-//                 [1; PACKET_DATA_SIZE],
-//                 Meta {
-//                     size: PACKET_DATA_SIZE,
-//                     addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-//                     port: 48289, // received on random port
-//                     flags: PacketFlags::empty(),
-//                 },
-//             ),
-//             Packet::new(
-//                 [2; PACKET_DATA_SIZE],
-//                 Meta {
-//                     size: PACKET_DATA_SIZE,
-//                     addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-//                     port: 9999,
-//                     flags: PacketFlags::empty(),
-//                 },
-//             ),
-//         ]);
-//         let (packet_sender, packet_receiver) = crossbeam_channel::unbounded::<PacketBatch>();
-//         packet_sender.send(packet_batch).unwrap();
+        packet_tx.send(packet).expect("send packet to fwd tile");
 
-//         let dest_socketaddrs = vec![
-//             SocketAddr::from_str("0.0.0.0:32881").unwrap(),
-//             SocketAddr::from_str("0.0.0.0:33881").unwrap(),
-//             SocketAddr::from_str("0.0.0.0:34881").unwrap(),
-//         ];
+        let mut recv_buf = [0u8; PACKET_DATA_SIZE];
+        let (n, _) = listener.recv_from(&mut recv_buf).expect("recv forwarded packet");
+        assert_eq!(&recv_buf[..n], payload);
 
-//         let blacklisted = SocketAddr::from_str("0.0.0.0:34881").unwrap(); // none blacklisted
+        let recycled = fill_rx
+            .recv_timeout(Duration::from_millis(1000))
+            .expect("recycled frame");
+        assert_eq!(recycled.ptr, shmem.ptr);
+        assert_eq!(recycled.frame_size, frame_size);
 
-//         let test_listeners = dest_socketaddrs
-//             .iter()
-//             .map(|socketaddr| {
-//                 (
-//                     UdpSocket::bind(socketaddr).unwrap(),
-//                     *socketaddr,
-//                     // store results in vec of packet, where packet is Vec<u8>
-//                     Arc::new(Mutex::new(vec![])),
-//                 )
-//             })
-//             .collect::<Vec<_>>();
-
-//         let udp_sender = UdpSocket::bind("0.0.0.0:10000").unwrap();
-
-//         // spawn listeners
-//         test_listeners
-//             .iter()
-//             .for_each(|(listen_socket, _socketaddr, to_receive)| {
-//                 let socket = listen_socket.try_clone().unwrap();
-//                 let to_receive = to_receive.to_owned();
-//                 thread::spawn(move || listen_and_collect(socket, to_receive));
-//             });
-
-//         // send packets
-//         recv_from_channel_and_send_multiple_dest(
-//             packet_receiver.recv(),
-//             &Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
-//                 &mut rand::thread_rng(),
-//                 crate::forwarder::DEDUPER_NUM_BITS,
-//             ))),
-//             &udp_sender,
-//             &Arc::new(dest_socketaddrs),
-//             move |_origin, dest: SocketAddr| dest != blacklisted,
-//             true,
-//             &Arc::new(ShredMetrics::default()),
-//         )
-//         .unwrap();
-
-//         // allow packets to be received
-//         sleep(Duration::from_millis(500));
-
-//         let received = test_listeners
-//             .iter()
-//             .take(test_listeners.len() - 1) // ignore blacklisted
-//             .map(|(_, _, results)| results.clone())
-//             .collect::<Vec<_>>();
-
-//         // check results
-//         for received in received.iter() {
-//             let received = received.lock().unwrap();
-//             assert_eq!(received.len(), 2);
-//             assert!(received
-//                 .iter()
-//                 .all(|packet| packet.len() == PACKET_DATA_SIZE));
-//             assert_eq!(received[0], [1; PACKET_DATA_SIZE]);
-//             assert_eq!(received[1], [2; PACKET_DATA_SIZE]);
-//         }
-
-//         {
-//             let received = test_listeners[2].2.lock().unwrap(); // ensure blacklisted received nothing
-//             assert_eq!(received.len(), 0);
-//         }
-//         assert_eq!(
-//             received
-//                 .iter()
-//                 .fold(0, |acc, elem| acc + elem.lock().unwrap().len()),
-//             4
-//         );
-//     }
-// }
+        exit.store(true, Ordering::Release);
+        drop(packet_tx);
+        let _ = wait_group.wait_first();
+        jh.join().expect("join packet_fwd_tile");
+    }
+}
