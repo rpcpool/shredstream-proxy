@@ -2,7 +2,7 @@ use std::{
     hint::spin_loop,
     sync::{
         Arc, atomic::{AtomicI32, AtomicUsize, Ordering}
-    }, time::Duration,
+    }, time::Duration, cell::UnsafeCell,
 };
 
 use bytes::{buf::UninitSlice, Buf, BufMut};
@@ -286,7 +286,7 @@ use std::{ptr, sync::atomic::AtomicBool};
 // We wrap T to include a 'ready' flag for each slot
 #[repr(C)]
 struct Slot<T: Sized> {
-    data: std::mem::MaybeUninit<T>,
+    data: UnsafeCell<std::mem::MaybeUninit<T>>,
     is_ready: AtomicBool,
 }
 
@@ -311,7 +311,7 @@ impl<T> Drop for RingInner<T> {
                 unsafe {
                     let slot = &mut *self.buf.add(tail & self.mask);
                     if slot.is_ready.load(Ordering::Acquire) {
-                        ptr::drop_in_place(slot.data.as_mut_ptr());
+                        ptr::drop_in_place((*slot.data.get()).as_mut_ptr());
                     }
                 }
                 tail = tail.wrapping_add(1);
@@ -405,7 +405,12 @@ impl<T> Tx<T> {
             if self
                 .inner
                 .head
-                .compare_exchange_weak(head, head + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange_weak(
+                    head,
+                    head.wrapping_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 unsafe {
@@ -414,7 +419,7 @@ impl<T> Tx<T> {
 
                     // 4. Write the data into the MaybeUninit.
                     // We use .write() which is a wrapper for ptr::write.
-                    ptr::write(slot.data.as_ptr() as *mut T, value);
+                    ptr::write((*slot.data.get()).as_mut_ptr(), value);
 
                     // 5. RELEASE the data to the consumer.
                     // This store ensures the data write above is visible to
@@ -510,13 +515,13 @@ impl<T> Rx<T> {
                 return None;
             }
 
-            let val = ptr::read(slot.data.as_ptr());
+            let val = ptr::read((*slot.data.get()).as_ptr());
 
             // Reset the flag for the next time this slot is used
             slot.is_ready.store(false, Ordering::Release);
 
             // Increment tail to free the slot
-            self.inner.tail.store(tail + 1, Ordering::Release);
+            self.inner.tail.store(tail.wrapping_add(1), Ordering::Release);
             Some(val)
         }
     }
@@ -524,7 +529,11 @@ impl<T> Rx<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Barrier, thread};
+    use std::{
+        collections::HashSet,
+        sync::{Arc as StdArc, Barrier, atomic::AtomicUsize as StdAtomicUsize},
+        thread,
+    };
 
     use super::*;
 
@@ -685,6 +694,27 @@ mod tests {
     }
 
     #[test]
+    fn test_recv_timeout_returns_value_before_deadline() {
+        let (tx, mut rx) = message_ring::<u64>(8).unwrap();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            tx.send(99).unwrap();
+        });
+
+        let out = rx.recv_timeout(Duration::from_millis(200));
+        assert_eq!(out, Some(99));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_message_ring_zero_capacity_behaves_as_one() {
+        let (tx, mut rx) = message_ring::<u64>(0).unwrap();
+        assert!(tx.send(1).is_ok());
+        assert_eq!(tx.send(2), Err(2));
+        assert_eq!(rx.recv(), 1);
+    }
+
+    #[test]
     #[should_panic(expected = "seek offset out of bounds")]
     fn test_seek_panics_when_offset_exceeds_frame_size() {
         let frame_size = 1500;
@@ -708,5 +738,71 @@ mod tests {
         };
         let mut buf_mut: FrameBufMut = desc.into();
         unsafe { buf_mut.advance_mut(frame_size + 1) };
+    }
+
+    #[test]
+    #[should_panic(expected = "advance out of bounds")]
+    fn test_buf_advance_panics_when_exceeding_len() {
+        let frame_size = 256;
+        let shmem = SharedMem::new(frame_size, 1, false).unwrap();
+        let desc = FrameDesc {
+            ptr: shmem.ptr,
+            frame_size,
+        };
+
+        let mut buf_mut: FrameBufMut = desc.into();
+        buf_mut.put_slice(&[1, 2, 3, 4]);
+        let mut buf: FrameBuf = buf_mut.into();
+        buf.advance(5);
+    }
+
+    #[test]
+    fn test_send_and_recv_work_across_counter_rollover() {
+        let (tx, mut rx) = message_ring::<u64>(8).unwrap();
+        tx.inner.head.store(usize::MAX, Ordering::Relaxed);
+        tx.inner.tail.store(usize::MAX, Ordering::Relaxed);
+
+        assert!(tx.send(1).is_ok());
+        assert_eq!(rx.recv(), 1);
+        assert_eq!(tx.inner.head.load(Ordering::Relaxed), 0);
+        assert_eq!(tx.inner.tail.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_send_and_recv_with_backlog_across_counter_rollover() {
+        let (tx, mut rx) = message_ring::<u64>(2).unwrap();
+        tx.inner.head.store(usize::MAX, Ordering::Relaxed);
+        tx.inner.tail.store(usize::MAX, Ordering::Relaxed);
+
+        assert!(tx.send(10).is_ok()); // head wraps to 0
+        assert!(tx.send(11).is_ok()); // queue full now
+        assert_eq!(tx.send(12), Err(12));
+        assert_eq!(tx.inner.head.load(Ordering::Relaxed), 1);
+
+        assert_eq!(rx.recv(), 10);
+        assert_eq!(rx.recv(), 11);
+        assert_eq!(tx.inner.tail.load(Ordering::Relaxed), 1);
+
+        assert!(tx.send(13).is_ok());
+        assert_eq!(rx.recv(), 13);
+    }
+
+    #[test]
+    fn test_drop_drops_pending_items_once() {
+        struct DropCounter(StdArc<StdAtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dropped = StdArc::new(StdAtomicUsize::new(0));
+        {
+            let (tx, _rx) = message_ring::<DropCounter>(8).unwrap();
+            for _ in 0..3 {
+                assert!(tx.send(DropCounter(StdArc::clone(&dropped))).is_ok());
+            }
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 3);
     }
 }
