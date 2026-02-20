@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket}, num::NonZeroUsize, os::fd::AsRawFd, str::FromStr, sync::{
-        Arc, atomic::{AtomicBool, Ordering}
+        Arc, Mutex, atomic::{AtomicBool, Ordering}
     }, thread::JoinHandle, time::{Duration, Instant}
 };
 
@@ -10,6 +10,7 @@ use crossbeam_channel::{Receiver, Sender};
 use itertools::izip;
 use libc;
 use log::{debug, error, info, warn};
+use mio::Waker;
 use solana_net_utils::SocketConfig;
 use solana_perf::deduper::Deduper;
 use solana_streamer::{
@@ -90,6 +91,7 @@ fn packet_recv_tile<R>(
     forwarder_stats: Arc<StreamerReceiveStats>,
     mut fill_rx: Rx<FrameDesc>,
     packet_tx_vec: Vec<Tx<TritonPacket>>,
+    wake_slot: Arc<Mutex<Option<Arc<Waker>>>>,
     packet_router: R,
     tile_drop_sig: TileClosedSignal,
 ) -> std::io::Result<JoinHandle<()>>
@@ -105,6 +107,7 @@ where
                 &forwarder_stats,
                 &mut fill_rx,
                 &packet_tx_vec,
+                wake_slot,
                 packet_router,
             )
             .expect("recv_loop");
@@ -193,6 +196,10 @@ fn packet_fwd_tile(
 
             let mut next_deduper_reset_attempt = Instant::now() + Duration::from_secs(2);
             let mut recycled_frames: Vec<FrameDesc> = Vec::with_capacity(UIO_MAXIOV);
+            const MAX_BATCH_AGE_US: u64 = 200;
+            let max_batch_age = Duration::from_micros(MAX_BATCH_AGE_US);
+            let mut queued_since: Option<Instant> = None;
+            let mut idle_backoff = 0u32;
             while !exit.load(Ordering::Relaxed) {
                 if next_deduper_reset_attempt.elapsed() > Duration::ZERO {
                     deduper.maybe_reset(
@@ -213,7 +220,8 @@ fn packet_fwd_tile(
                 }
 
                 if queued.is_empty() && recycled_frames.is_empty() && next_batch_send.is_empty() {
-                    if let Some(packet) = packet_rx.recv_timeout(Duration::from_millis(100)) {
+                    if let Some(packet) = packet_rx.try_recv() {
+                        idle_backoff = 0;
                         let data_size = packet.meta.size;
                         let data_slice = &packet.buffer.chunk()[..data_size];
                         if deduper.dedup(data_slice) {
@@ -222,13 +230,35 @@ fn packet_fwd_tile(
                             recycled_frames.push(desc);
                             stats.duplicate.fetch_add(1, Ordering::Relaxed);
                         } else {
+                            if queued_since.is_none() {
+                                queued_since = Some(Instant::now());
+                            }
                             queued.push_back(packet);
                         }
+                    } else {
+                        if exit.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        idle_backoff = idle_backoff.saturating_add(1);
+                        if idle_backoff <= 256 {
+                            std::hint::spin_loop();
+                        } else if idle_backoff <= 1024 {
+                            std::thread::yield_now();
+                        } else {
+                            std::thread::park_timeout(Duration::from_micros(50));
+                        }
+                        continue;
                     }
                 }
 
                 // Fill up the queued OR recycled_frames as much as possible
                 'fill_backlog: while queued.len() < UIO_MAXIOV && recycled_frames.len() < UIO_MAXIOV {
+                    if queued_since
+                        .map(|ts| ts.elapsed() >= max_batch_age && !queued.is_empty())
+                        .unwrap_or(false)
+                    {
+                        break 'fill_backlog;
+                    }
                     // Fill the batch as much as possible.
                     let Some(packet) = packet_rx.try_recv() else {
                         break 'fill_backlog;
@@ -243,6 +273,9 @@ fn packet_fwd_tile(
                         stats.duplicate.fetch_add(1, Ordering::Relaxed);
                         inc_packets_deduped(1);
                     } else {
+                        if queued_since.is_none() {
+                            queued_since = Some(Instant::now());
+                        }
                         queued.push_back(packet);
                     }
                     let dedup_duration = t.elapsed();
@@ -283,6 +316,9 @@ fn packet_fwd_tile(
                         let buf_clone = unsafe { buf.unsafe_subslice_clone(0, packet.meta.size) };
                         next_batch_send.push((buf_clone, *dest));
                     }
+                }
+                if queued.is_empty() {
+                    queued_since = None;
                 }
 
                 assert!(
@@ -419,6 +455,8 @@ pub fn run_proxy_system<R>(
 
     let mut packet_rx_vec: Vec<Rx<TritonPacket>> = Vec::with_capacity(num_pkt_fwd_tiles);
     let mut packet_tx_vec: Vec<Tx<TritonPacket>> = Vec::with_capacity(num_pkt_fwd_tiles);
+    let mut recv_wake_slots: Vec<Arc<Mutex<Option<Arc<Waker>>>>> =
+        Vec::with_capacity(num_pkt_recv_tiles);
 
     // Create the shared memory regions for recv tiles
     for shmem_idx in 0..num_pkt_recv_tiles {
@@ -575,6 +613,8 @@ pub fn run_proxy_system<R>(
         let exit = Arc::clone(&exit);
         let forwarder_stats = Arc::clone(&pk_recv_stats);
         let packet_tx_vec_clone = packet_tx_vec.clone();
+        let wake_slot: Arc<Mutex<Option<Arc<Waker>>>> = Arc::new(Mutex::new(None));
+        recv_wake_slots.push(Arc::clone(&wake_slot));
         let pkt_router_clone = pkt_router.clone();
         let jh = packet_recv_tile(
             pkt_recv_idx,
@@ -583,6 +623,7 @@ pub fn run_proxy_system<R>(
             forwarder_stats,
             fill_rx,
             packet_tx_vec_clone,
+            wake_slot,
             pkt_router_clone,
             tile_wait_group.get_tile_closed_signal(TileKind::PktRecv, pkt_recv_idx),
         )
@@ -596,6 +637,16 @@ pub fn run_proxy_system<R>(
     warn!("Tile of kind {kind:?} with idx {idx} has exited. Shutting down proxy system");
 
     exit.store(true, Ordering::Release);
+    for wake_slot in &recv_wake_slots {
+        if let Some(waker) = wake_slot
+            .lock()
+            .expect("recv wake slot lock poisoned")
+            .as_ref()
+            .cloned()
+        {
+            let _ = waker.wake();
+        }
+    }
     drop(fill_tx_vec);
     drop(packet_tx_vec);
     log::info!("Waiting for {} tile threads to exit", tile_thread_vec.len());

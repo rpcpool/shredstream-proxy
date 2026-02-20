@@ -1,14 +1,14 @@
 use std::{
-    cmp, io, mem::{self, MaybeUninit, zeroed}, net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket}, num, os::fd::AsRawFd, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant}
+    cmp, io, mem::{self, MaybeUninit, zeroed}, net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket}, num, os::fd::AsRawFd, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}, time::{Duration, Instant}
 };
 
 use bytes::{Buf, BufMut};
 use itertools::izip;
 use libc::{AF_INET, AF_INET6, MSG_DONTWAIT, iovec, mmsghdr, msghdr, sockaddr_storage};
 use log::error;
-use mio::Poll;
+use mio::{Poll, Token, Waker};
 use socket2::socklen_t;
-use solana_perf::packet::{NUM_RCVMMSGS, PACKETS_PER_BATCH};
+use solana_perf::packet::PACKETS_PER_BATCH;
 use solana_sdk::packet::{Meta, PACKET_DATA_SIZE};
 use solana_streamer::{streamer::StreamerReceiveStats};
 
@@ -52,6 +52,7 @@ pub fn recv_loop<R>(
     stats: &StreamerReceiveStats,
     fill_rx: &mut Rx<FrameDesc>,
     packet_tx_vec: &[Tx<TritonPacket>],
+    wake_slot: Arc<Mutex<Option<Arc<Waker>>>>,
     router: R,
 ) -> std::io::Result<()>
 where
@@ -63,7 +64,11 @@ where
     let mut next_stats_report = Instant::now() + Duration::from_secs(1);
     let mut router_dest_dist = vec![0usize; packet_tx_vec.len()];
     let mut poll = Poll::new()?;
-    let mut events = mio::Events::with_capacity(sk_vec.len());
+    const WAKE_TOKEN: Token = Token(usize::MAX);
+    let mut events = mio::Events::with_capacity(sk_vec.len() + 1);
+    let wake_handle = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
+    *wake_slot.lock().expect("recv wake slot lock poisoned") = Some(Arc::clone(&wake_handle));
+    let mut empty_fill_backoff = 0u32;
 
     let mut mio_sockets: Vec<mio::net::UdpSocket> = sk_vec
         .iter()
@@ -81,7 +86,7 @@ where
     while !exit.load(Ordering::Relaxed) {
 
         // Events are always cleared before receiving new ones
-        let result = poll.poll(&mut events, Some(Duration::from_millis(100)));
+        let result = poll.poll(&mut events, None);
 
         match result {
             Ok(_) => { }
@@ -114,7 +119,19 @@ where
             continue;
         };
         'drain_readiness_loop: while !exit.load(Ordering::Relaxed) {
-            
+            if ev.token() == WAKE_TOKEN {
+                if exit.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                match ev_iter.next() {
+                    Some(next_ev) => {
+                        ev = next_ev;
+                        continue 'drain_readiness_loop;
+                    }
+                    None => break 'drain_readiness_loop,
+                }
+            }
+
             let sk_idx = ev.token().0;
             let recv_sk = &sk_vec[sk_idx];
 
@@ -125,15 +142,20 @@ where
                     Some(frame_desc) => {
                         let frame_bufmut = frame_desc.as_mut_buf();
                         frame_bufmut_vec.push(frame_bufmut);
+                        empty_fill_backoff = 0;
                     }
                     None => {
                         if frame_bufmut_vec.is_empty() {
-                            // block until we get at least one frame buffer
-                            let Some(frame_desc) = fill_rx.recv_timeout(Duration::from_millis(100)) else {
-                                break 'fill_bufmut
-                            };
-                            let frame_bufmut = frame_desc.as_mut_buf();
-                            frame_bufmut_vec.push(frame_bufmut);
+                            if exit.load(Ordering::Relaxed) {
+                                break 'fill_bufmut;
+                            }
+                            empty_fill_backoff = empty_fill_backoff.saturating_add(1);
+                            if empty_fill_backoff <= 128 {
+                                std::hint::spin_loop();
+                            } else {
+                                std::thread::yield_now();
+                            }
+                            break 'fill_bufmut;
                         } else {
                             break 'fill_bufmut;
                         }
@@ -285,6 +307,7 @@ pub fn triton_recv_mmsg(
     fill_buffers: &mut Vec<FrameBufMut>,
     packets: &mut Vec<TritonPacket>,
 ) -> io::Result</*num packets:*/ usize> {
+    const RECV_BURST_TARGET: usize = 32;
     // Should never hit this, but bail if the caller didn't provide any Packets
     // to receive into
     if fill_buffers.is_empty() {
@@ -292,9 +315,9 @@ pub fn triton_recv_mmsg(
     }
     // Assert that there are no leftovers in packets.
     const SOCKADDR_STORAGE_SIZE: socklen_t = mem::size_of::<sockaddr_storage>() as socklen_t;
-    let mut iovs = [MaybeUninit::uninit(); NUM_RCVMMSGS];
-    let mut addrs = [MaybeUninit::zeroed(); NUM_RCVMMSGS];
-    let mut hdrs = [MaybeUninit::uninit(); NUM_RCVMMSGS];
+    let mut iovs = [MaybeUninit::uninit(); RECV_BURST_TARGET];
+    let mut addrs = [MaybeUninit::zeroed(); RECV_BURST_TARGET];
+    let mut hdrs = [MaybeUninit::uninit(); RECV_BURST_TARGET];
     let remaining_packets = packets.capacity() - packets.len();
     let sock_fd = sock.as_raw_fd();
     let count = cmp::min(iovs.len(), remaining_packets).min(fill_buffers.len());
@@ -303,7 +326,7 @@ pub fn triton_recv_mmsg(
         return Ok(0);
     }
 
-    let mut frame_buffer_inflight_vec: [MaybeUninit<FrameBufMut>; NUM_RCVMMSGS] =
+    let mut frame_buffer_inflight_vec: [MaybeUninit<FrameBufMut>; RECV_BURST_TARGET] =
         std::array::from_fn(|_| MaybeUninit::uninit());
 
     let mut frame_buffer_inflight_cnt = 0;
