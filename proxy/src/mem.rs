@@ -15,6 +15,7 @@ pub struct AllocError;
 pub struct SharedMem {
     pub ptr: *mut u8,
     len: usize,
+    closed: bool
 }
 
 pub fn try_alloc_shared_mem(
@@ -56,14 +57,18 @@ impl SharedMem {
         let ptr = try_alloc_shared_mem(element_size, capacity, huge)?;
         let len = capacity * element_size;
 
-        Ok(Self { ptr, len })
+        Ok(Self { ptr, len, closed: false })
     }
 
     pub fn len(&self) -> usize {
         self.len
     }
 
-    pub fn dealloc(self) {
+    pub fn dealloc(mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
         }
@@ -72,6 +77,10 @@ impl SharedMem {
 
 impl Drop for SharedMem {
     fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
         }
@@ -158,7 +167,13 @@ unsafe impl Send for FrameBuf {}
 
 impl From<FrameBufMut> for FrameBuf {
     fn from(buf_mut: FrameBufMut) -> Self {
-        let len = (buf_mut.ptr as usize) - (buf_mut.desc.ptr as usize);
+        let len = (buf_mut.ptr as usize)
+            .checked_sub(buf_mut.desc.ptr as usize)
+            .expect("FrameBufMut pointer underflow");
+        assert!(
+            len <= buf_mut.desc.frame_size,
+            "FrameBufMut pointer out of bounds"
+        );
         Self {
             curr_ptr: buf_mut.desc.ptr,
             len,
@@ -181,17 +196,14 @@ impl FrameDesc {
 
 impl From<FrameDesc> for FrameBufMut {
     fn from(desc: FrameDesc) -> Self {
-        Self {
-            ptr: desc.ptr,
-            desc,
-        }
+        Self { ptr: desc.ptr, desc }
     }
 }
 
 impl FrameBufMut {
     #[inline]
     pub fn base(&self) -> *mut u8 {
-        ((self.ptr as usize) & !(self.desc.frame_size - 1)) as *mut u8
+        self.desc.ptr
     }
 
     #[inline]
@@ -202,7 +214,19 @@ impl FrameBufMut {
 
     #[inline]
     fn end_ptr(&self) -> *const u8 {
-        unsafe { self.base().add(self.capacity()) }
+        unsafe { self.desc.ptr.add(self.capacity()) }
+    }
+
+    #[inline]
+    fn frame_offset(&self) -> usize {
+        let frame_offset = (self.ptr as usize)
+            .checked_sub(self.desc.ptr as usize)
+            .expect("FrameBufMut pointer underflow");
+        assert!(
+            frame_offset <= self.desc.frame_size,
+            "FrameBufMut pointer out of bounds"
+        );
+        frame_offset
     }
 
     #[inline]
@@ -212,10 +236,7 @@ impl FrameBufMut {
 
     #[inline]
     pub unsafe fn seek(&mut self, offset: usize) {
-        assert!(
-            offset < self.desc.frame_size,
-            "seek offset out of bounds"
-        );
+        assert!(offset <= self.desc.frame_size, "seek offset out of bounds");
         let new_ptr = self.desc.ptr.add(offset);
         let end_ptr = self.end_ptr();
         assert!(new_ptr as *const u8 <= end_ptr, "seek out of bounds");
@@ -225,10 +246,7 @@ impl FrameBufMut {
 
 unsafe impl BufMut for FrameBufMut {
     fn remaining_mut(&self) -> usize {
-        // given that ptr must always aligned with `frame_align`,
-        // we just be able to infer the remaining mut size from frame_align
-        let frame_offset = (self.ptr as usize) & (self.desc.frame_size - 1);
-        self.desc.frame_size - frame_offset
+        self.desc.frame_size - self.frame_offset()
     }
 
     unsafe fn advance_mut(&mut self, cnt: usize) {
@@ -552,10 +570,10 @@ mod tests {
 
     #[test]
     fn test_frame_buffer_lifecycle() {
-        let align = 4096;
+        let frame_size = 4096;
         let capacity = 1;
         // 1. Setup the memory pool
-        let mem = SharedMem::new(align, capacity, false).unwrap();
+        let mem = SharedMem::new(frame_size, capacity, false).unwrap();
 
         // At this point, the fill_ring inside PagedAlignedMem logic
         // should have been populated. Let's create our own handles for testing.
@@ -565,8 +583,8 @@ mod tests {
         for i in 0..capacity {
             tx_fill
                 .send(FrameDesc {
-                    ptr: unsafe { mem.ptr.add(i * align) },
-                    frame_size: align,
+                    ptr: unsafe { mem.ptr.add(i * frame_size) },
+                    frame_size,
                 })
                 .unwrap();
         }
@@ -618,7 +636,7 @@ mod tests {
         assert_eq!(buf_mut.remaining_mut(), 4096);
         buf_mut.put_slice(&[1, 2, 3, 4]);
         assert_eq!(buf_mut.remaining_mut(), 4092);
-        assert_eq!(buf_mut.chunk_mut().len(), 4);
+        assert_eq!(buf_mut.chunk_mut().len(), 4092);
 
         let mut buf: FrameBuf = buf_mut.into();
         assert_eq!(buf.len(), 4);
@@ -628,5 +646,67 @@ mod tests {
         buf.advance(4);
         assert_eq!(buf.remaining(), 0);
         assert_eq!(buf.len(), 0)
+    }
+
+    #[test]
+    fn test_bufmut_non_power_of_two_frame_size() {
+        let frame_size = 1500;
+        let shmem = SharedMem::new(frame_size, 1, false).unwrap();
+        let desc = FrameDesc {
+            ptr: shmem.ptr,
+            frame_size,
+        };
+
+        let mut buf_mut: FrameBufMut = desc.into();
+        assert_eq!(buf_mut.base(), shmem.ptr);
+        assert_eq!(buf_mut.remaining_mut(), frame_size);
+
+        buf_mut.put_slice(&[1, 2, 3, 4, 5]);
+        assert_eq!(buf_mut.remaining_mut(), frame_size - 5);
+
+        unsafe { buf_mut.seek(frame_size) };
+        assert_eq!(buf_mut.remaining_mut(), 0);
+    }
+
+    #[test]
+    fn test_send_returns_err_when_ring_is_full() {
+        let (tx, _rx) = message_ring::<u64>(1).unwrap();
+        assert!(tx.send(1).is_ok());
+        assert_eq!(tx.send(2), Err(2));
+    }
+
+    #[test]
+    fn test_recv_timeout_returns_none() {
+        let (_tx, mut rx) = message_ring::<u64>(8).unwrap();
+        let start = std::time::Instant::now();
+        let out = rx.recv_timeout(Duration::from_millis(30));
+        assert_eq!(out, None);
+        assert!(start.elapsed() >= Duration::from_millis(25));
+    }
+
+    #[test]
+    #[should_panic(expected = "seek offset out of bounds")]
+    fn test_seek_panics_when_offset_exceeds_frame_size() {
+        let frame_size = 1500;
+        let shmem = SharedMem::new(frame_size, 1, false).unwrap();
+        let desc = FrameDesc {
+            ptr: shmem.ptr,
+            frame_size,
+        };
+        let mut buf_mut: FrameBufMut = desc.into();
+        unsafe { buf_mut.seek(frame_size + 1) };
+    }
+
+    #[test]
+    #[should_panic(expected = "advance_mut out of bounds")]
+    fn test_advance_mut_panics_when_exceeding_capacity() {
+        let frame_size = 256;
+        let shmem = SharedMem::new(frame_size, 1, false).unwrap();
+        let desc = FrameDesc {
+            ptr: shmem.ptr,
+            frame_size,
+        };
+        let mut buf_mut: FrameBufMut = desc.into();
+        unsafe { buf_mut.advance_mut(frame_size + 1) };
     }
 }
