@@ -1,11 +1,5 @@
 use std::{
-    cmp,
-    io,
-    mem::{self, zeroed, MaybeUninit},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
-    os::fd::AsRawFd,
-    sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
+    cmp, io, mem::{self, MaybeUninit, zeroed}, net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket}, num, os::fd::AsRawFd, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant}
 };
 
 use bytes::{Buf, BufMut};
@@ -38,6 +32,9 @@ pub struct FECSetRoutingStrategy;
 
 impl PacketRoutingStrategy for FECSetRoutingStrategy {
     fn route_packet(&self, packet: &TritonPacket, num_dest: usize) -> Option<usize> {
+        if num_dest == 0 {
+            return None;
+        }
         let shred_buf = packet.buffer.chunk();
         let slot = solana_ledger::shred::wire::get_slot(shred_buf)?;
         let fec = shred_buf.get(79..79 + 4)?;
@@ -60,6 +57,7 @@ pub fn recv_loop<R>(
 where
     R: PacketRoutingStrategy,
 {
+    assert!(packet_tx_vec.len() > 0, "packet_tx_vec must have at least one destination");
     let mut packet_batch = Vec::with_capacity(PACKETS_PER_BATCH);
     let mut frame_bufmut_vec = Vec::with_capacity(PACKETS_PER_BATCH);
     let mut next_stats_report = Instant::now() + Duration::from_secs(1);
@@ -67,10 +65,14 @@ where
     let mut poll = Poll::new()?;
     let mut events = mio::Events::with_capacity(sk_vec.len());
 
+    let mut mio_sockets: Vec<mio::net::UdpSocket> = sk_vec
+        .iter()
+        .map(|sk| mio::net::UdpSocket::from_std(sk.try_clone().unwrap()))
+        .collect();
     // Initial registration of sockets
-    for (i, socket) in sk_vec.iter().enumerate() {
+    for (i, socket) in mio_sockets.iter_mut().enumerate() {
         poll.registry().register(
-            &mut mio::net::UdpSocket::from_std(socket.try_clone().unwrap()),
+            socket,
             mio::Token(i),
             mio::Interest::READABLE,
         )?;
@@ -293,6 +295,11 @@ pub fn triton_recv_mmsg(
     let remaining_packets = packets.capacity() - packets.len();
     let sock_fd = sock.as_raw_fd();
     let count = cmp::min(iovs.len(), remaining_packets).min(fill_buffers.len());
+
+    if count == 0 {
+        return Ok(0);
+    }
+
     let mut frame_buffer_inflight_vec: [MaybeUninit<FrameBufMut>; NUM_RCVMMSGS] =
         std::array::from_fn(|_| MaybeUninit::uninit());
 
@@ -346,18 +353,12 @@ pub fn triton_recv_mmsg(
     } else {
         usize::try_from(nrecv).unwrap()
     };
-    for (addr, hdr, filled_bufmut) in
-        izip!(addrs, hdrs, frame_buffer_inflight_vec).take(nrecv)
-    {
-        // SAFETY: We initialized `count` elements of `hdrs` above. `count` is
-        // passed to recvmmsg() as the limit of messages that can be read. So,
-        // `nrevc <= count` which means we initialized this `hdr` and
-        // recvmmsg() will have updated it appropriately
-        let hdr_ref = unsafe { hdr.assume_init_ref() };
-        // SAFETY: Similar to above, we initialized this `addr` and recvmmsg()
-        // will have populated it
-        let addr_ref = unsafe { addr.assume_init_ref() };
-        let mut filled_bufmut = unsafe { filled_bufmut.assume_init_read() };
+    for idx in 0..nrecv {
+        // SAFETY: `nrecv <= count` and we initialized `count` entries in `hdrs`.
+        let hdr_ref = unsafe { hdrs[idx].assume_init_ref() };
+        // SAFETY: Same argument as above for `addrs`.
+        let addr_ref = unsafe { addrs[idx].assume_init_ref() };
+        let mut filled_bufmut = unsafe { frame_buffer_inflight_vec[idx].assume_init_read() };
         unsafe { filled_bufmut.seek(hdr_ref.msg_len as usize); }
         let filled_buf: FrameBuf = filled_bufmut.into();
         let mut pkt = TritonPacket {
@@ -369,6 +370,16 @@ pub fn triton_recv_mmsg(
             pkt.meta_mut().set_socket_addr(&addr);
         }
         packets.push(pkt);
+    }
+
+    // Return submitted buffers that were not filled by this syscall.
+    for in_flight in frame_buffer_inflight_vec
+        .iter_mut()
+        .take(frame_buffer_inflight_cnt)
+        .skip(nrecv)
+    {
+        let buffer = unsafe { in_flight.assume_init_read() };
+        fill_buffers.push(buffer);
     }
 
     for (iov, addr, hdr) in izip!(&mut iovs, &mut addrs, &mut hdrs).take(count) {
@@ -438,4 +449,198 @@ fn cast_socket_addr(addr: &sockaddr_storage, hdr: &mmsghdr) -> Option<SocketAddr
         addr.ss_family, hdr.msg_hdr.msg_namelen
     );
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libc::{sa_family_t, sockaddr_in, sockaddr_in6};
+    use std::thread;
+
+    #[test]
+    fn test_create_msghdr_fields() {
+        let mut addr = MaybeUninit::<sockaddr_storage>::zeroed();
+        let mut iov = MaybeUninit::<iovec>::uninit();
+        let namelen = std::mem::size_of::<sockaddr_storage>() as socklen_t;
+        let hdr = create_msghdr(&mut addr, namelen, &mut iov);
+
+        assert_eq!(hdr.msg_name, addr.as_mut_ptr() as *mut _);
+        assert_eq!(hdr.msg_namelen, namelen);
+        assert_eq!(hdr.msg_iov, iov.as_mut_ptr());
+        assert_eq!(hdr.msg_iovlen, 1);
+    }
+
+    #[test]
+    fn test_cast_socket_addr_ipv4() {
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        let port = 12345u16;
+
+        let mut storage: sockaddr_storage = unsafe { zeroed() };
+        let sin = sockaddr_in {
+            sin_family: AF_INET as sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(ip.octets()),
+            },
+            sin_zero: [0; 8],
+        };
+        unsafe {
+            std::ptr::write(&mut storage as *mut _ as *mut sockaddr_in, sin);
+        }
+
+        let mut hdr: mmsghdr = unsafe { zeroed() };
+        hdr.msg_hdr.msg_namelen = std::mem::size_of::<sockaddr_in>() as socklen_t;
+
+        let out = cast_socket_addr(&storage, &hdr);
+        assert_eq!(out, Some(SocketAddr::V4(SocketAddrV4::new(ip, port))));
+    }
+
+    #[test]
+    fn test_cast_socket_addr_ipv6() {
+        let ip = Ipv6Addr::LOCALHOST;
+        let port = 54321u16;
+        let flowinfo = 7u32;
+        let scope_id = 9u32;
+
+        let mut storage: sockaddr_storage = unsafe { zeroed() };
+        let sin6 = sockaddr_in6 {
+            sin6_family: AF_INET6 as sa_family_t,
+            sin6_port: port.to_be(),
+            sin6_flowinfo: flowinfo,
+            sin6_addr: libc::in6_addr {
+                s6_addr: ip.octets(),
+            },
+            sin6_scope_id: scope_id,
+        };
+        unsafe {
+            std::ptr::write(&mut storage as *mut _ as *mut sockaddr_in6, sin6);
+        }
+
+        let mut hdr: mmsghdr = unsafe { zeroed() };
+        hdr.msg_hdr.msg_namelen = std::mem::size_of::<sockaddr_in6>() as socklen_t;
+
+        let out = cast_socket_addr(&storage, &hdr);
+        assert_eq!(
+            out,
+            Some(SocketAddr::V6(SocketAddrV6::new(ip, port, flowinfo, scope_id)))
+        );
+    }
+
+    #[test]
+    fn test_cast_socket_addr_invalid_returns_none() {
+        let storage: sockaddr_storage = unsafe { zeroed() };
+        let mut hdr: mmsghdr = unsafe { zeroed() };
+        hdr.msg_hdr.msg_namelen = 0;
+        assert_eq!(cast_socket_addr(&storage, &hdr), None);
+    }
+
+    #[test]
+    fn test_hash_pair_is_deterministic_and_mixes_inputs() {
+        let h1 = hash_pair(123, 456);
+        let h2 = hash_pair(123, 456);
+        let h3 = hash_pair(124, 456);
+        let h4 = hash_pair(123, 457);
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
+        assert_ne!(h1, h4);
+    }
+
+    #[test]
+    fn test_triton_recv_mmsg_with_udp_socket() {
+        let recv_sock = match UdpSocket::bind("127.0.0.1:0") {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("failed to bind recv socket: {e}"),
+        };
+        let send_sock = match UdpSocket::bind("127.0.0.1:0") {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("failed to bind send socket: {e}"),
+        };
+        let recv_addr = recv_sock.local_addr().unwrap();
+        let payload = b"hello-recv-mmsg";
+
+        send_sock.send_to(payload, recv_addr).unwrap();
+
+        let shmem = crate::mem::SharedMem::new(PACKET_DATA_SIZE, 1, false).unwrap();
+        let mut fill_buffers = vec![FrameDesc {
+            ptr: shmem.ptr,
+            frame_size: PACKET_DATA_SIZE,
+        }
+        .as_mut_buf()];
+        let mut packets = Vec::<TritonPacket>::with_capacity(NUM_RCVMMSGS);
+
+        let mut recv_count = 0usize;
+        for _ in 0..30 {
+            match triton_recv_mmsg(&recv_sock, &mut fill_buffers, &mut packets) {
+                Ok(n) => {
+                    recv_count = n;
+                    if n > 0 {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("triton_recv_mmsg failed: {e}"),
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(recv_count, 1);
+        assert_eq!(packets.len(), 1);
+        let pkt = &packets[0];
+        assert_eq!(pkt.meta.size, payload.len());
+        assert_eq!(&pkt.buffer.chunk()[..payload.len()], payload);
+    }
+
+    #[test]
+    fn test_triton_recv_mmsg_returns_unused_buffers() {
+        let recv_sock = match UdpSocket::bind("127.0.0.1:0") {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => panic!("skipping test_triton_recv_mmsg_returns_unused_buffers due to lack of permissions to bind UDP socket"),
+            Err(e) => panic!("failed to bind recv socket: {e}"),
+        };
+        let send_sock = match UdpSocket::bind("127.0.0.1:0") {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => panic!("skipping test_triton_recv_mmsg_returns_unused_buffers due to lack of permissions to bind UDP socket"),
+            Err(e) => panic!("failed to bind send socket: {e}"),
+        };
+        let recv_addr = recv_sock.local_addr().unwrap();
+        let payload = b"one-packet-only";
+        send_sock.send_to(payload, recv_addr).unwrap();
+
+        let shmem = crate::mem::SharedMem::new(PACKET_DATA_SIZE, 2, false).unwrap();
+        let mut fill_buffers = vec![
+            FrameDesc {
+                ptr: shmem.ptr,
+                frame_size: PACKET_DATA_SIZE,
+            }
+            .as_mut_buf(),
+            FrameDesc {
+                ptr: unsafe { shmem.ptr.add(PACKET_DATA_SIZE) },
+                frame_size: PACKET_DATA_SIZE,
+            }
+            .as_mut_buf(),
+        ];
+        let mut packets = Vec::<TritonPacket>::with_capacity(NUM_RCVMMSGS);
+
+        let mut recv_count = 0usize;
+        for _ in 0..30 {
+            match triton_recv_mmsg(&recv_sock, &mut fill_buffers, &mut packets) {
+                Ok(n) => {
+                    recv_count = n;
+                    if n > 0 {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("triton_recv_mmsg failed: {e}"),
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(recv_count, 1);
+        assert_eq!(packets.len(), 1);
+        // One buffer used by the received packet, one should be returned.
+        assert_eq!(fill_buffers.len(), 1);
+    }
 }
