@@ -59,7 +59,7 @@ pub fn start_forwarder_threads(
     src_addr: IpAddr,
     src_port: u16,
     maybe_multicast_socket: Option<Vec<UdpSocket>>,
-    maybe_triton_multicast_socket: Option<(IpAddr, Vec<UdpSocket>)>,
+    maybe_triton_multicast_socket: Option<(IpAddr, UdpSocket)>,
     num_threads: Option<usize>,
     deduper: Arc<RwLock<Deduper<2, [u8]>>>,
     should_reconstruct_shreds: bool,
@@ -141,11 +141,13 @@ pub fn start_forwarder_threads(
         thread_hdls.push(hdl);
     };
 
-    let mut ret =  sockets
+    sockets
         .into_iter()
         .chain(maybe_multicast_socket.unwrap_or_default())
+        .map(|socket| (vec![], socket))
+        .chain(maybe_triton_multicast_socket.into_iter().map(|(origin, socket)| (vec![origin], socket)))
         .enumerate()
-        .flat_map(|(thread_id, source)| {
+        .flat_map(|(thread_id, (additional_dest_filter_addr_vec, source))| {
             let (packet_sender, packet_receiver) = crossbeam_channel::unbounded();
             let listen_thread = streamer::receiver(
                 format!("ssListen{thread_id}"),
@@ -172,21 +174,28 @@ pub fn start_forwarder_threads(
                 .name(format!("ssPxyTx_{thread_id}"))
                 .spawn(move || {
                     let dont_send_to_origin = move |origin: IpAddr, dest: SocketAddr| {
-                        origin != dest.ip()
+                        origin != dest.ip() && !additional_dest_filter_addr_vec.contains(&dest.ip())
                     };
                     let send_socket = {
                         let ipv6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
                         match try_create_ipv6_socket(ipv6_addr) {
                             Ok(socket) => {
                                 info!("Successfully bound send socket to IPv6 dual-stack address.");
+                                socket.set_multicast_loop_v6(false)
+                                    .expect("Failed to disable IPv6 multicast loopback");
                                 socket
                             }
                             Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
                                 // This error (code 97 on Linux) means IPv6 is not supported.
                                 warn!("IPv6 not available. Falling back to IPv4-only for sending.");
                                 let ipv4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-                                UdpSocket::bind(ipv4_addr)
-                                    .expect("Failed to bind to IPv4 socket after IPv6 failed")
+                                let socket = UdpSocket::bind(ipv4_addr)
+                                    .expect("Failed to bind to IPv4 socket after IPv6 failed");
+                                socket.set_multicast_ttl_v4(IP_MULTICAST_TTL).expect("IP_MULTICAST_TTL_V4");
+                                socket.set_multicast_loop_v4(false)
+                                    .expect("Failed to disable IPv4 multicast loopback");
+                                socket
+
                             }
                             Err(e) => {
                                 // For any other error (e.g., port in use), panic.
@@ -215,7 +224,7 @@ pub fn start_forwarder_threads(
                                     &deduper,
                                     &send_socket,
                                     &local_dest_sockets,
-                                    dont_send_to_origin,
+                                    &dont_send_to_origin,
                                     should_reconstruct_shreds,
                                     &reconstruct_tx,
                                     debug_trace_shred,
@@ -245,27 +254,7 @@ pub fn start_forwarder_threads(
 
             vec![listen_thread, send_thread]
         })
-        .collect::<Vec<JoinHandle<()>>>();
-
-    if let Some((multicast_origin, multicast_socket)) = maybe_triton_multicast_socket {
-        start_multicast_forwarder_thread(
-            multicast_origin, 
-            multicast_socket, 
-            recycler, 
-            reconstruct_tx, 
-            unioned_dest_sockets, 
-            deduper, 
-            forward_stats, 
-            metrics, 
-            debug_trace_shred, 
-            should_reconstruct_shreds, 
-            use_discovery_service, 
-            shutdown_receiver, 
-            exit, 
-            &mut ret
-        );
-    }
-    ret
+        .collect::<Vec<JoinHandle<()>>>()
 }
 
 ///
@@ -276,139 +265,6 @@ fn try_create_ipv6_socket(addr: SocketAddr) -> Result<UdpSocket, std::io::Error>
     ipv6_socket.set_multicast_hops_v6(IP_MULTICAST_TTL)?;
     ipv6_socket.bind(&addr.into())?;
     Ok(ipv6_socket.into())
-}
-
-pub struct MulticastSource {
-    pub socket: Arc<UdpSocket>,
-    pub group: IpAddr,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn start_multicast_forwarder_thread(
-    multicast_origin: IpAddr,
-    sockets: Vec<UdpSocket>,
-    recycler: PacketBatchRecycler,
-    reconstruct_tx: crossbeam_channel::Sender<PacketBatch>,
-    unioned_dest_sockets: Arc<ArcSwap<Vec<SocketAddr>>>,
-    deduper: Arc<RwLock<Deduper<2, [u8]>>>,
-    forward_stats: Arc<StreamerReceiveStats>,
-    metrics: Arc<ShredMetrics>,
-    debug_trace_shred: bool,
-    should_reconstruct_shreds: bool,
-    use_discovery_service: bool,
-    shutdown_receiver: Receiver<()>,
-    exit: Arc<AtomicBool>,
-    out: &mut Vec<JoinHandle<()>>,
-) {
-    for (thread_id, socket) in sockets.into_iter().enumerate() {
-        let (packet_sender, packet_receiver) = crossbeam_channel::unbounded();
-        let listen_thread = streamer::receiver(
-            format!("ssListenMulticast{thread_id}"),
-            Arc::new(socket),
-            exit.clone(),
-            packet_sender,
-            recycler.clone(),
-            forward_stats.clone(),
-            Duration::default(),
-            false,
-            None,
-            false,
-        );
-
-        out.push(listen_thread);
-        let deduper = deduper.clone();
-        let unioned_dest_sockets = unioned_dest_sockets.clone();
-        let metrics = metrics.clone();
-        let shutdown_receiver = shutdown_receiver.clone();
-        let reconstruct_tx = reconstruct_tx.clone();
-        let exit = exit.clone();
-
-        
-
-        let send_thread = Builder::new()
-            .name(format!("ssPxyTxMulticast_{thread_id}"))
-            .spawn(move || {
-                let dont_send_to_mc_origin = move |_origin, dest: SocketAddr| {
-                    dest.ip() != multicast_origin
-                };
-                let send_socket = {
-                    let ipv6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-                    match try_create_ipv6_socket(ipv6_addr) {
-                        Ok(socket) => {
-                            info!("Successfully bound send socket to IPv6 dual-stack address.");
-                            socket.set_multicast_loop_v6(false)
-                              .expect("Failed to disable IPv6 multicast loopback");
-                            socket
-                        }
-                        Err(e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
-                            // This error (code 97 on Linux) means IPv6 is not supported.
-                            warn!("IPv6 not available. Falling back to IPv4-only for sending.");
-                            let ipv4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-                            let socket = UdpSocket::bind(ipv4_addr)
-                                .expect("Failed to bind to IPv4 socket after IPv6 failed");
-                            socket.set_multicast_ttl_v4(IP_MULTICAST_TTL).expect("IP_MULTICAST_TTL_V4");
-                            socket.set_multicast_loop_v4(false)
-                                .expect("Failed to disable IPv4 multicast loopback");
-                            socket
-                        }
-                        Err(e) => {
-                            // For any other error (e.g., port in use), panic.
-                            panic!("Failed to bind send socket with an unexpected error: {e}");
-                        }
-                    }
-                };
-                let mut local_dest_sockets = unioned_dest_sockets.load();
-
-                let refresh_subscribers_tick = if use_discovery_service {
-                    crossbeam_channel::tick(Duration::from_secs(30))
-                } else {
-                    crossbeam_channel::tick(Duration::MAX)
-                };
-
-                while !exit.load(Ordering::Relaxed) {
-                    crossbeam_channel::select! {
-                        // forward packets
-                        recv(packet_receiver) -> maybe_packet_batch => {
-                            let res = recv_from_channel_and_send_multiple_dest(
-                                maybe_packet_batch,
-                                &deduper,
-                                &send_socket,
-                                &local_dest_sockets,
-                                dont_send_to_mc_origin,
-                                should_reconstruct_shreds,
-                                &reconstruct_tx,
-                                debug_trace_shred,
-                                &metrics,
-                            );
-
-                            // If the channel is closed or error, break out
-                            if res.is_err() {
-                                break;
-                            }
-                        }
-
-                        // refresh thread-local subscribers
-                        recv(refresh_subscribers_tick) -> _ => {
-                            local_dest_sockets = unioned_dest_sockets.load();
-                        }
-
-                        // handle shutdown (avoid using sleep since it can hang)
-                        recv(shutdown_receiver) -> _ => {
-                            break;
-                        }
-                    }
-                }
-                info!("Exiting forwarder thread {thread_id}.");
-            })
-            .unwrap();
-
-        out.push(send_thread);
-    }
-}
-
-#[allow(dead_code)]
-fn accept_all(_origin: IpAddr, _dest: SocketAddr) -> bool {
-    true
 }
 
 /// Broadcasts the same packet to multiple recipients, parses it into a Shred if possible,
@@ -912,7 +768,11 @@ mod tests {
     };
     use solana_sdk::packet::{PacketFlags, PACKET_DATA_SIZE};
 
-    use crate::forwarder::{accept_all, recv_from_channel_and_send_multiple_dest, ShredMetrics};
+    use crate::forwarder::{recv_from_channel_and_send_multiple_dest, ShredMetrics};
+
+    fn accept_all(_origin: IpAddr, _dest: SocketAddr) -> bool {
+        true
+    }
 
     fn listen_and_collect(listen_socket: UdpSocket, received_packets: Arc<Mutex<Vec<Vec<u8>>>>) {
         let mut buf = [0u8; PACKET_DATA_SIZE];
