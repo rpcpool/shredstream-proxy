@@ -26,7 +26,7 @@ lazy_static::lazy_static! {
 
     static ref RECV_PACKET_COUNT_HIST: Histogram = Histogram::with_opts(
         HistogramOpts::new("shredstream_recv_packet_count", "Number of packets in incoming batch (before dedup)")
-            .buckets(vec![1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 64.0, 100.0])
+            .buckets(vec![1.0, 5.0, 10.0, 20.0, 50.0, 64.0])
     ).unwrap();
 
     static ref PACKETS_RECEIVED_TOTAL: Counter = Counter::new(
@@ -49,6 +49,26 @@ lazy_static::lazy_static! {
         Opts::new("shredstream_packets_by_source", "Packets per source IP"),
         &["addr", "status"]
     ).unwrap();
+
+    static ref ROUTING_DROP: Counter = Counter::new(
+        "shredstream_routing_drop_total", "Packets dropped due to routing issues"
+    ).unwrap();
+
+    static ref ROUTING_SEND: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+
+            "shredstream_routing_send_total", "Packets successfully routed to send queue"
+        ),
+        &["queue"]
+    ).unwrap();
+}
+
+pub fn inc_routing_drop() {
+    ROUTING_DROP.inc();
+}
+
+pub fn inc_routing_send<S: AsRef<str>>(queue_label: S) {
+    ROUTING_SEND.with_label_values(&[queue_label.as_ref()]).inc();
 }
 
 pub fn observe_dedup_time(microseconds: f64) {
@@ -102,6 +122,8 @@ pub fn register_metrics(registry: &prometheus::Registry) {
     registry.register(Box::new(PACKETS_FORWARDED_TOTAL.clone())).unwrap();
     registry.register(Box::new(PACKETS_FORWARD_FAILED_TOTAL.clone())).unwrap();
     registry.register(Box::new(PACKETS_BY_SOURCE.clone())).unwrap();
+    registry.register(Box::new(ROUTING_DROP.clone())).unwrap();
+    registry.register(Box::new(ROUTING_SEND.clone())).unwrap();
 }
 
 

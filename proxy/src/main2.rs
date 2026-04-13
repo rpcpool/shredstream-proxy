@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap, io::{self, Error, ErrorKind}, net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs}, panic, path::{Path, PathBuf}, str::FromStr, sync::{
+    collections::HashMap, io::{self, Error, ErrorKind}, net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs}, num::NonZeroUsize, panic, path::{Path, PathBuf}, str::FromStr, sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, RwLock,
+        Arc,
     }, thread::{self, sleep, spawn, JoinHandle}, time::Duration
 };
 
@@ -13,34 +13,27 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use solana_client::client_error::{reqwest, ClientError};
 use solana_ledger::shred::Shred;
 use solana_metrics::set_host_id;
-use solana_perf::deduper::Deduper;
 use solana_sdk::{clock::Slot, signature::read_keypair_file};
 use solana_streamer::streamer::StreamerReceiveStats;
 use thiserror::Error;
-use tokio::{runtime::Runtime, sync::broadcast::Sender as BroadcastSender};
+use tokio::runtime::Runtime;
 use tonic::Status;
 
 use crate::{
-    forwarder::ShredMetrics, multicast_config::{create_multicast_socket_on_device, create_multicast_sockets_triton, TritonMulticastConfig, TritonMulticastConfigV4, TritonMulticastConfigV6},
-    token_authenticator::BlockEngineConnectionError,
+    forwarder::ShredMetrics, multicast_config::{TritonMulticastConfig, TritonMulticastConfigV4, TritonMulticastConfigV6, create_multicast_socket_on_device}, recv_mmsg::FECSetRoutingStrategy, token_authenticator::BlockEngineConnectionError, triton_forwarder::PktRecvTileMemConfig
 };
-mod deshred;
+pub mod deshred;
 pub mod forwarder;
-mod heartbeat;
-mod multicast_config;
-mod server;
-mod token_authenticator;
-mod prom;
-mod recv_mmsg;
-mod mem;
-mod triton_forwarder;
+pub mod heartbeat;
+pub mod multicast_config;
+pub mod server;
+pub mod token_authenticator;
+pub mod prom;
+pub mod recv_mmsg;
+pub mod mem;
+pub mod triton_forwarder;
 
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
+use triton_forwarder::{PktRecvMemSizing};
 
 #[derive(Clone, Debug, Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -133,10 +126,6 @@ struct CommonArgs {
     #[arg(long, env, default_value_t = false)]
     debug_trace_shred: bool,
 
-    /// GRPC port for serving decoded shreds as Solana entries
-    #[arg(long, env)]
-    grpc_service_port: Option<u16>,
-
     /// Public IP address to use.
     /// Overrides value fetched from `ifconfig.me`.
     #[arg(long, env)]
@@ -145,27 +134,44 @@ struct CommonArgs {
     /// Number of threads to use. Defaults to use up to 4.
     #[arg(long, env)]
     num_threads: Option<usize>,
+
     ///
     /// The multicast group (ip addr) to join for receiving shreds.
     /// Multicast groups supports IPv4 and IPv6.
     #[arg(long, env)]
     triton_multicast_group: Option<IpAddr>,
-    
-    /// 
     /// The interface to bind to for triton multicast.
-    /// 
+    /// If IPV6 is used, this argument must be provided.
+    /// If ipv4, then optional (listen on all interfaces if not provided).
     #[arg(long, env)]
     triton_multicast_bind_interface: Option<String>,
-    
+
     ///
-    /// The multicast port to subscribe to for triton multicast.
-    /// 
+    /// The port to listen on for triton multicast.
+    /// If not provided, defaults to 8002.
+    /// NOTE: this port must match the port used by the triton multicast sender.
     #[arg(long, env)]
     triton_multicast_subscription_port: Option<u16>,
 
     /// Address to bind prometheus metrics server to. If not provided, prometheus server is disabled.
     #[arg(long, env)]
     prometheus_bind_addr: Option<SocketAddr>,
+
+    /// Number of tiles dedicated to receiving packets. If not provided, defaults to number of CPU cores is 1.
+    #[arg(long, env)]
+    num_pkt_recv_tile: Option<NonZeroUsize>,
+
+    /// Number of tiles dedicated to forwarding packets. If not provided, defaults to number of CPU cores is 1.
+    #[arg(long, env)]
+    num_pkt_fwd_tile: Option<NonZeroUsize>,
+
+    /// Memory sizing for EACH packet receiver, uses t-shirt size convention (xs (default),s,m,l,xl,2xl,3xl,4xl,5xl). Each size increase double the memory, starting at 128MiB for x-small.
+    #[arg(long, env)]
+    pkt_recv_channel_memsize: Option<PktRecvMemSizing>,
+
+    /// Use hugepage memory for pkt recv tiles shared memory.
+    #[arg(long, env, default_value_t = false)]
+    hugepage: bool,
 }
 
 #[derive(Debug, Error)]
@@ -242,13 +248,22 @@ fn main() -> Result<(), ShredstreamProxyError> {
     let prom_registry  = prometheus::Registry::new();
     prom::register_metrics(&prom_registry);
     let all_args: Args = Args::parse();
-
     let shredstream_args = all_args.shredstream_args.clone();
     // common args
     let args = match all_args.shredstream_args {
         ProxySubcommands::Shredstream(x) => x.common_args,
         ProxySubcommands::ForwardOnly(x) => x,
     };
+
+
+    let num_pkt_recv_tiles = args.num_pkt_recv_tile
+        .map(|x| x.get())
+        .unwrap_or(args.num_threads.unwrap_or(1));
+
+    let num_pkt_fwd_tiles = args.num_pkt_fwd_tile
+        .map(|x| x.get())
+        .unwrap_or(args.num_threads.unwrap_or(1));
+
     set_host_id(hostname::get()?.into_string().unwrap());
     if (args.endpoint_discovery_url.is_none() && args.discovered_endpoints_port.is_some())
         || (args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_none())
@@ -278,12 +293,12 @@ fn main() -> Result<(), ShredstreamProxyError> {
         }));
     }
 
-    let metrics = Arc::new(ShredMetrics::new(args.grpc_service_port.is_some()));
+    let metrics = Arc::new(ShredMetrics::new(false));
     
 
-    let runtime = Runtime::new()?;
     let mut thread_handles = vec![];
     if let ProxySubcommands::Shredstream(args) = shredstream_args {
+        let runtime = Runtime::new()?;
         if args.desired_regions.len() > 2 {
             warn!(
                 "Too many regions requested, only regions: {:?} will be used",
@@ -303,18 +318,11 @@ fn main() -> Result<(), ShredstreamProxyError> {
             .collect::<Vec<SocketAddr>>(),
     ));
 
-    // share deduper + metrics between forwarder <-> accessory thread
-    // use mutex since metrics are write heavy. cheaper than rwlock
-    let deduper = Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
-        &mut rand::thread_rng(),
-        forwarder::DEDUPER_NUM_BITS,
-    )));
-
-    let entry_sender = Arc::new(BroadcastSender::new(100));
     let forward_stats = Arc::new(StreamerReceiveStats::new("shredstream_proxy-listen_thread"));
     let use_discovery_service =
         args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
-    let maybe_multicast_socket = create_multicast_socket_on_device(
+
+    let maybe_dz_multicast_socket_vec = create_multicast_socket_on_device(
         &args.multicast_device,
         args.multicast_subscribe_port,
         args.multicast_bind_ip,
@@ -355,33 +363,38 @@ fn main() -> Result<(), ShredstreamProxyError> {
         None => None,
     };
 
-    let maybe_triton_multicast_socket = maybe_triton_multicast_config
-        .and_then(|config| {
-            Some(
-                create_multicast_sockets_triton(&config)
-                    .map(|ok| (config.ip(), ok))
-            )
+    let pkt_recv_tile_mem_config = PktRecvTileMemConfig {
+        memory_size: args.pkt_recv_channel_memsize.unwrap_or_default(),
+        hugepage: args.hugepage,
+        ..Default::default()
+    };
+    let proxy_th = {
+        let exit = Arc::clone(&exit);
+        let pkt_recv_stats = forward_stats.clone();
+        let pkt_fwd_stats = metrics.clone();
+        let unioned_dest_sockets = Arc::clone(&unioned_dest_sockets);
+        std::thread::Builder::new()
+        .name("tritonProxyMain".to_string())
+        .spawn(move || {
+            triton_forwarder::run_proxy_system(
+                pkt_recv_tile_mem_config,
+                unioned_dest_sockets,
+                maybe_triton_multicast_config,
+                args.src_bind_addr,
+                args.src_bind_port,
+                num_pkt_recv_tiles,
+                num_pkt_fwd_tiles,
+                FECSetRoutingStrategy,
+                exit,
+                pkt_recv_stats,
+                pkt_fwd_stats,
+                maybe_dz_multicast_socket_vec.unwrap_or_default(),
+            );
         })
-        .transpose()?;
+        .expect("tritonProxyMain")
+    };
 
-    let forwarder_hdls = forwarder::start_forwarder_threads(
-        unioned_dest_sockets.clone(),
-        args.src_bind_addr,
-        args.src_bind_port,
-        maybe_multicast_socket,
-        maybe_triton_multicast_socket,
-        args.num_threads,
-        deduper.clone(),
-        args.grpc_service_port.is_some(),
-        entry_sender.clone(),
-        args.debug_trace_shred,
-        use_discovery_service,
-        forward_stats.clone(),
-        metrics.clone(),
-        shutdown_receiver.clone(),
-        exit.clone(),
-    );
-    thread_handles.extend(forwarder_hdls);
+    thread_handles.push(proxy_th);
 
     let report_metrics_thread = {
         let exit = exit.clone();
@@ -394,8 +407,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
     };
     thread_handles.push(report_metrics_thread);
 
-    let metrics_hdl = forwarder::start_forwarder_accessory_thread(
-        deduper,
+    let metrics_hdl = triton_forwarder::start_forwarder_accessory_thread(
         metrics.clone(),
         args.metrics_report_interval_ms,
         shutdown_receiver.clone(),
@@ -412,16 +424,6 @@ fn main() -> Result<(), ShredstreamProxyError> {
             exit.clone(),
         );
         thread_handles.push(refresh_handle);
-    }
-
-    if let Some(port) = args.grpc_service_port {
-        let server_hdl = server::start_server_thread(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
-            entry_sender.clone(),
-            exit.clone(),
-            shutdown_receiver.clone(),
-        );
-        thread_handles.push(server_hdl);
     }
 
     if let Some(prom_bind_addr) = args.prometheus_bind_addr {
