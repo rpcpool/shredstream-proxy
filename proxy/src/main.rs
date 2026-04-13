@@ -1,18 +1,8 @@
 use std::{
-    collections::HashMap,
-    io,
-    io::{Error, ErrorKind},
-    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
-    panic,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::{
+    collections::HashMap, io::{self, Error, ErrorKind}, net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs}, panic, path::{Path, PathBuf}, str::FromStr, sync::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
-    },
-    thread,
-    thread::{sleep, spawn, JoinHandle},
-    time::Duration,
+    }, thread::{self, sleep, spawn, JoinHandle}, time::Duration
 };
 
 use arc_swap::ArcSwap;
@@ -31,7 +21,7 @@ use tokio::{runtime::Runtime, sync::broadcast::Sender as BroadcastSender};
 use tonic::Status;
 
 use crate::{
-    forwarder::ShredMetrics, multicast_config::create_multicast_socket_on_device,
+    forwarder::ShredMetrics, multicast_config::{create_multicast_socket_on_device, create_multicast_sockets_triton, TritonMulticastConfig, TritonMulticastConfigV4, TritonMulticastConfigV6},
     token_authenticator::BlockEngineConnectionError,
 };
 mod deshred;
@@ -40,6 +30,14 @@ mod heartbeat;
 mod multicast_config;
 mod server;
 mod token_authenticator;
+mod prom;
+
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Clone, Debug, Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -144,6 +142,27 @@ struct CommonArgs {
     /// Number of threads to use. Defaults to use up to 4.
     #[arg(long, env)]
     num_threads: Option<usize>,
+    ///
+    /// The multicast group (ip addr) to join for receiving shreds.
+    /// Multicast groups supports IPv4 and IPv6.
+    #[arg(long, env)]
+    triton_multicast_group: Option<IpAddr>,
+    
+    /// 
+    /// The interface to bind to for triton multicast.
+    /// 
+    #[arg(long, env)]
+    triton_multicast_bind_interface: Option<String>,
+    
+    ///
+    /// The multicast port to subscribe to for triton multicast.
+    /// 
+    #[arg(long, env)]
+    triton_multicast_subscription_port: Option<u16>,
+
+    /// Address to bind prometheus metrics server to. If not provided, prometheus server is disabled.
+    #[arg(long, env)]
+    prometheus_bind_addr: Option<SocketAddr>,
 }
 
 #[derive(Debug, Error)]
@@ -217,7 +236,8 @@ fn shutdown_notifier(exit: Arc<AtomicBool>) -> io::Result<(Sender<()>, Receiver<
 pub type ReconstructedShredsMap = HashMap<Slot, HashMap<u32 /* fec_set_index */, Vec<Shred>>>;
 fn main() -> Result<(), ShredstreamProxyError> {
     env_logger::builder().init();
-
+    let prom_registry  = prometheus::Registry::new();
+    prom::register_metrics(&prom_registry);
     let all_args: Args = Args::parse();
 
     let shredstream_args = all_args.shredstream_args.clone();
@@ -256,6 +276,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
     }
 
     let metrics = Arc::new(ShredMetrics::new(args.grpc_service_port.is_some()));
+    
 
     let runtime = Runtime::new()?;
     let mut thread_handles = vec![];
@@ -296,11 +317,56 @@ fn main() -> Result<(), ShredstreamProxyError> {
         args.multicast_bind_ip,
     )
     .inspect(|mcast_socket| info!("Multicast listeners found: {mcast_socket:?}."));
+
+    let maybe_triton_multicast_config = match args.triton_multicast_group {
+        Some(multicast_group) => {
+            let device_ifname = args.triton_multicast_bind_interface.clone().ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "'triton-multicast-bind-interface' is required if 'triton-multicast-group' is set",
+                )
+            })?;
+            let subscription_port = args.triton_multicast_subscription_port.ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "'triton-multicast-subscription-port' is required if 'triton-multicast-group' is set",
+                )
+            })?;
+            match multicast_group {
+                IpAddr::V4(ipv4) => {
+                    Some(TritonMulticastConfig::Ipv4(TritonMulticastConfigV4 {
+                        multicast_ip: ipv4,
+                        device_ifname: device_ifname,
+                        subscription_port,
+                    }))
+                }
+                IpAddr::V6(ipv6) => {
+                    Some(TritonMulticastConfig::Ipv6(TritonMulticastConfigV6 {
+                        multicast_ip: ipv6,
+                        device_ifname: device_ifname,
+                        subscription_port,
+                    }))
+                }
+            }
+        }
+        None => None,
+    };
+
+    let maybe_triton_multicast_socket = maybe_triton_multicast_config
+        .and_then(|config| {
+            Some(
+                create_multicast_sockets_triton(&config)
+                    .map(|ok| (config.ip(), ok))
+            )
+        })
+        .transpose()?;
+
     let forwarder_hdls = forwarder::start_forwarder_threads(
         unioned_dest_sockets.clone(),
         args.src_bind_addr,
         args.src_bind_port,
         maybe_multicast_socket,
+        maybe_triton_multicast_socket,
         args.num_threads,
         deduper.clone(),
         args.grpc_service_port.is_some(),
@@ -355,10 +421,21 @@ fn main() -> Result<(), ShredstreamProxyError> {
         thread_handles.push(server_hdl);
     }
 
+    if let Some(prom_bind_addr) = args.prometheus_bind_addr {
+        let prom_hdl = prom::spawn_prometheus_server(
+            prom_bind_addr, 
+            prom_registry, 
+            shutdown_receiver.clone()
+        );
+        thread_handles.push(prom_hdl);
+    }
+
     info!(
         "Shredstream started, listening on {}:{}/udp.",
         args.src_bind_addr, args.src_bind_port
     );
+
+    
 
     for thread in thread_handles {
         thread.join().expect("thread panicked");
