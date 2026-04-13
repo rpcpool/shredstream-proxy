@@ -1,5 +1,5 @@
 use std::{
-    io, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket}, num::NonZeroUsize, process::Command
+    io, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket}, process::Command
 };
 
 use itertools::{Either, Itertools};
@@ -194,12 +194,14 @@ pub fn create_multicast_socket_on_device(
 
 pub struct TritonMulticastConfigV4 {
     pub multicast_ip: Ipv4Addr,
-    pub bind_ifname: Option<String>,
+    pub device_ifname: String,
+    pub subscription_port: u16,
 }
 
 pub struct TritonMulticastConfigV6 {
     pub multicast_ip: Ipv6Addr,
     pub device_ifname: String,
+    pub subscription_port: u16,
 }
 
 pub enum TritonMulticastConfig {
@@ -218,109 +220,49 @@ impl TritonMulticastConfig {
 
 pub fn create_multicast_sockets_triton_v4(
     config: &TritonMulticastConfigV4,
-    num_threads: NonZeroUsize,
-) -> io::Result<Vec<UdpSocket>> {
-    let device_ip = match config.bind_ifname.as_ref() {
-        Some(ifname) => {
-            ipv4_addr_for_device(ifname)?.ok_or_else(|| 
-                io::Error::new(io::ErrorKind::NotFound, format!("No IPv4 address found for device {ifname}"))
-            )?
-        },
-        None => Ipv4Addr::UNSPECIFIED,
-    };
+) -> io::Result<UdpSocket> {
+    let device_ip = ipv4_addr_for_device(&config.device_ifname)?
+        .ok_or_else(|| 
+            io::Error::new(io::ErrorKind::NotFound, format!("No IPv4 address found for device {}", config.device_ifname))
+        )?;
 
     // Step 1: Create first socket, port = 0 → random ephemeral port
-    let first_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    first_socket.set_reuse_address(true)?;
-    first_socket.set_reuse_port(true)?;
-    first_socket.bind(&SockAddr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)))?;
-    first_socket.join_multicast_v4(&config.multicast_ip, &device_ip)?;
-    let local_port = first_socket.local_addr()?.as_socket().unwrap().port();
-
-    // Step 2: Create N-1 sockets using that same port
-    let mut sockets = Vec::with_capacity(num_threads.get());
-    sockets.push(first_socket.into());
-
-    for _ in 1..num_threads.get() {
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        socket.set_reuse_address(true)?;
-        socket.set_reuse_port(true)?;
-        socket.bind(&SockAddr::from(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            local_port,
-        )))?;
-        socket.join_multicast_v4(&config.multicast_ip, &device_ip)?;
-        sockets.push(socket.into());
-    }
-
-    Ok(sockets)
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.bind(&SockAddr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.subscription_port)))?;
+    socket.join_multicast_v4(&config.multicast_ip, &device_ip)?;
+    Ok(socket.into())
 }
-
-// fn create_multicast_socket_triton_v6(
-//     config: &TritonMulticastConfigV6,
-//     num_threads: usize,
-// ) -> Result<UdpSocket, io::Error> {
-//     let TritonMulticastConfigV6 {
-//         multicast_ip,
-//         device_ifname,
-//     } = config;
-
-//     let addrv6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-//     let socket = UdpSocket::bind(addrv6)?;
-//     let ifindex = ifindex_for_device(device_ifname)?
-//         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("No such device {device_ifname}")))?;
-//     socket.join_multicast_v6(multicast_ip, ifindex)?;
-//     Ok(socket)
-// }
 
 
 pub fn create_multicast_sockets_triton_v6(
     config: &TritonMulticastConfigV6,
-    num_threads: NonZeroUsize,
-) -> io::Result<Vec<UdpSocket>> {
+) -> io::Result<UdpSocket> {
     // Get the interface index for the device name (e.g. "eth0")
     let ifindex = ifindex_for_device(&config.device_ifname)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("No such device {}", config.device_ifname)))?;
 
     // Step 1: Bind first socket to port 0 to let kernel choose a random available port
-    let first_socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-    first_socket.set_only_v6(true)?;            // IPv6-only
-    first_socket.set_reuse_address(true)?;
-    first_socket.set_reuse_port(true)?;
-    first_socket.bind(&SockAddr::from(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)))?;
-    first_socket.join_multicast_v6(&config.multicast_ip, ifindex)?;
-    let local_port = first_socket.local_addr()?.as_socket().unwrap().port();
-    // Step 2: Create N-1 additional sockets on the same port for load balancing
-    let mut sockets = Vec::with_capacity(num_threads.get());
-    sockets.push(first_socket.into());
-
-    for _ in 1..num_threads.get() {
-        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-        socket.set_only_v6(true)?;
-        socket.set_reuse_address(true)?;
-        socket.set_reuse_port(true)?;
-        socket.bind(&SockAddr::from(SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            local_port,
-        )))?;
-        socket.join_multicast_v6(&config.multicast_ip, ifindex)?;
-        sockets.push(socket.into());
-    }
-
-    Ok(sockets)
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(true)?;            // IPv6-only
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.bind(&SockAddr::from(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.subscription_port)))?;
+    socket.join_multicast_v6(&config.multicast_ip, ifindex)?;
+    Ok(socket.into())
 }
 
 pub fn create_multicast_sockets_triton(
     config: &TritonMulticastConfig,
-    num_threads: NonZeroUsize,
-) -> Result<Vec<UdpSocket>, io::Error> {
+) -> Result<UdpSocket, io::Error> {
 
     match config {
         TritonMulticastConfig::Ipv4(cfg) => {
-            create_multicast_sockets_triton_v4(cfg, num_threads)
+            create_multicast_sockets_triton_v4(cfg)
         }
         TritonMulticastConfig::Ipv6(cfg) => {
-            create_multicast_sockets_triton_v6(cfg, num_threads)
+            create_multicast_sockets_triton_v6(cfg)
         }
     }
 }
