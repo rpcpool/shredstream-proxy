@@ -12,7 +12,7 @@ use solana_perf::packet::PACKETS_PER_BATCH;
 use solana_sdk::packet::{Meta, PACKET_DATA_SIZE};
 use solana_streamer::{streamer::StreamerReceiveStats};
 
-use crate::{mem::{FrameBuf, FrameBufMut, FrameDesc, Rx, Tx}, prom::{inc_packets_received, observe_recv_packet_count}};
+use crate::{mem::{FrameBuf, FrameBufMut, FrameDesc, Rx, Tx}, prom::{inc_packets_received, inc_routing_drop, inc_routing_send, observe_recv_packet_count}};
 
 pub trait PacketRoutingStrategy: Clone {
     fn route_packet(&self, packet: &TritonPacket, num_dest: usize) -> Option<usize>;
@@ -63,6 +63,10 @@ where
     let mut frame_bufmut_vec = Vec::with_capacity(PACKETS_PER_BATCH);
     let mut next_stats_report = Instant::now() + Duration::from_secs(1);
     let mut router_dest_dist = vec![0usize; packet_tx_vec.len()];
+    let mut router_dest_label_vec = Vec::with_capacity(packet_tx_vec.len());
+    for idx in 0..packet_tx_vec.len() {
+        router_dest_label_vec.push(idx.to_string());
+    }
     let mut poll = Poll::new()?;
     const WAKE_TOKEN: Token = Token(usize::MAX);
     let mut events = mio::Events::with_capacity(sk_vec.len() + 1);
@@ -200,6 +204,7 @@ where
                                     log::trace!("Failed to route packet {:?}", packet);
                                     let trashed_frame_bufmut = packet.buffer.into_inner().as_mut_buf();
                                     frame_bufmut_vec.push(trashed_frame_bufmut);
+                                    inc_routing_drop();
                                     continue 'packet_drain;
                                 }
                             };
@@ -207,6 +212,7 @@ where
                             let _ = &packet_tx_vec[dest_idx]
                                 .send(packet)
                                 .unwrap_or_else(|_packet| panic!("failed to send packet to {dest_idx} ring is full, distr:{:?}", router_dest_dist));
+                            inc_routing_send(&router_dest_label_vec[dest_idx]);
                         }
                     }
                 }

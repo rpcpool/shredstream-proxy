@@ -21,7 +21,7 @@ use solana_streamer::{
 use crate::{
     forwarder::{ShredMetrics, try_create_ipv6_socket}, mem::{FrameBuf, FrameDesc, Rx, SharedMem, Tx}, prom::{
         inc_packets_deduped, inc_packets_forward_failed, observe_dedup_time, observe_recv_interval, observe_send_duration, observe_send_packet_count
-    }, recv_mmsg::{PacketRoutingStrategy, TritonPacket}, triton_multicast_config::TritonMulticastConfig
+    }, recv_mmsg::{PacketRoutingStrategy, TritonPacket}, multicast_config::TritonMulticastConfig
 };
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
@@ -195,11 +195,8 @@ fn packet_fwd_tile(
             assert_eq!(fill_tx_vec.len(), shmem_info_vec.len());
 
             let mut next_deduper_reset_attempt = Instant::now() + Duration::from_secs(2);
-            let mut recycled_frames: Vec<FrameDesc> = Vec::with_capacity(UIO_MAXIOV);
-            const MAX_BATCH_AGE_US: u64 = 200;
-            let max_batch_age = Duration::from_micros(MAX_BATCH_AGE_US);
-            let mut queued_since: Option<Instant> = None;
-            let mut idle_backoff = 0u32;
+            let mut recycled_frames: Vec<FrameDesc> = Vec::new();
+
             while !exit.load(Ordering::Relaxed) {
                 if next_deduper_reset_attempt.elapsed() > Duration::ZERO {
                     deduper.maybe_reset(
@@ -208,10 +205,9 @@ fn packet_fwd_tile(
                         DEDUPER_RESET_CYCLE,
                     );
                     next_deduper_reset_attempt = Instant::now() + Duration::from_secs(2);
-                    // show stats here...
                     log::debug!(
-                        "send_batch_count: {}, duplicate: {}, total-pkt-sent: {}, queue-len: {}, to-recycle: {}", 
-                        stats.send_batch_count.load(Ordering::Relaxed), 
+                        "send_batch_count: {}, duplicate: {}, total-pkt-sent: {}, queue-len: {}, to-recycle: {}",
+                        stats.send_batch_count.load(Ordering::Relaxed),
                         stats.duplicate.load(Ordering::Relaxed),
                         stats.send_batch_size_sum.load(Ordering::Relaxed),
                         queued.len(),
@@ -219,63 +215,21 @@ fn packet_fwd_tile(
                     );
                 }
 
-                if queued.is_empty() && recycled_frames.is_empty() && next_batch_send.is_empty() {
-                    if let Some(packet) = packet_rx.try_recv() {
-                        idle_backoff = 0;
-                        let data_size = packet.meta.size;
-                        let data_slice = &packet.buffer.chunk()[..data_size];
-                        if deduper.dedup(data_slice) {
-                            // put it inside the recycle queue
-                            let desc = packet.buffer.into_inner();
-                            recycled_frames.push(desc);
-                            stats.duplicate.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            if queued_since.is_none() {
-                                queued_since = Some(Instant::now());
-                            }
-                            queued.push_back(packet);
-                        }
-                    } else {
-                        if exit.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        idle_backoff = idle_backoff.saturating_add(1);
-                        if idle_backoff <= 256 {
-                            std::hint::spin_loop();
-                        } else if idle_backoff <= 1024 {
-                            std::thread::yield_now();
-                        } else {
-                            std::thread::park_timeout(Duration::from_micros(50));
-                        }
-                        continue;
-                    }
-                }
-
-                // Fill up the queued OR recycled_frames as much as possible
-                'fill_backlog: while queued.len() < UIO_MAXIOV && recycled_frames.len() < UIO_MAXIOV {
-                    if queued_since
-                        .map(|ts| ts.elapsed() >= max_batch_age && !queued.is_empty())
-                        .unwrap_or(false)
-                    {
-                        break 'fill_backlog;
-                    }
-                    // Fill the batch as much as possible.
+                // Drain packet_rx as fast as possible until queued is full or no packet is available.
+                while queued.len() < UIO_MAXIOV {
                     let Some(packet) = packet_rx.try_recv() else {
-                        break 'fill_backlog;
+                        break;
                     };
+
                     let data_size = packet.meta.size;
                     let data_slice = &packet.buffer.chunk()[..data_size];
                     let t = Instant::now();
                     if deduper.dedup(data_slice) {
-                        // put it inside the recycle queue
                         let desc = packet.buffer.into_inner();
                         recycled_frames.push(desc);
                         stats.duplicate.fetch_add(1, Ordering::Relaxed);
                         inc_packets_deduped(1);
                     } else {
-                        if queued_since.is_none() {
-                            queued_since = Some(Instant::now());
-                        }
                         queued.push_back(packet);
                     }
                     let dedup_duration = t.elapsed();
@@ -290,87 +244,72 @@ fn packet_fwd_tile(
                     dests_len,
                     UIO_MAXIOV
                 );
-                // Fill up the next_batch_send
-                'fill_batch_send: while next_batch_send.len() < UIO_MAXIOV
-                    && queued.len() > 0
-                    && recycled_frames.len() < UIO_MAXIOV
-                {
-                    let remaining = UIO_MAXIOV - next_batch_send.len();
-                    if dests_len > remaining {
-                        break 'fill_batch_send;
-                    }
 
-                    let Some(packet) = queued.pop_front() else {
-                        break 'fill_batch_send;
-                    };
-                    let buf = packet.buffer;
-                    let desc = unsafe { buf.detach_desc() };
-                    recycled_frames.push(desc);
+                // Send as much as possible from queued.
+                while !queued.is_empty() {
+                    next_batch_send.clear();
 
-                    for dest in dests.iter() {
-                        let origin = packet.meta.socket_addr().ip();
-                        if origin == dest.ip() {
-                            continue;
+                    while next_batch_send.len() < UIO_MAXIOV && !queued.is_empty() {
+                        let remaining = UIO_MAXIOV - next_batch_send.len();
+                        if dests_len > remaining {
+                            break;
                         }
-                        // Cheap to do since we are just copying a pointer
-                        let buf_clone = unsafe { buf.unsafe_subslice_clone(0, packet.meta.size) };
-                        next_batch_send.push((buf_clone, *dest));
-                    }
-                }
-                if queued.is_empty() {
-                    queued_since = None;
-                }
 
-                assert!(
-                    next_batch_send.len() <= UIO_MAXIOV,
-                    "next_batch_send.len() = {}",
-                    next_batch_send.len()
-                );
-                assert!(
-                    recycled_frames.len() <= UIO_MAXIOV,
-                    "recycled_frames.len() = {}",
-                    recycled_frames.len()
-                );
-                assert!(
-                    queued.len() <= UIO_MAXIOV,
-                    "queued.len() = {}",
-                    queued.len()
-                );
-                
-                let batch_send_ts = Instant::now();
-                
-                if !next_batch_send.is_empty() {
+                        let Some(packet) = queued.pop_front() else {
+                            break;
+                        };
+                        let buf = packet.buffer;
+                        let desc = unsafe { buf.detach_desc() };
+                        recycled_frames.push(desc);
+
+                        for dest in dests.iter() {
+                            let buf_clone =
+                                unsafe { buf.unsafe_subslice_clone(0, packet.meta.size) };
+                            next_batch_send.push((buf_clone, *dest));
+                        }
+                    }
+
+                    if next_batch_send.is_empty() {
+                        break;
+                    }
+
+                    let batch_send_ts = Instant::now();
                     let e = last_batch_to_send.elapsed();
                     last_batch_to_send = Instant::now();
-                    
+
                     observe_recv_interval(e.as_micros() as f64);
                     match batch_send(&send_socket, &next_batch_send) {
                         Ok(_) => {
-                            // Successfully sent all packets in the batch
                             let send_duration = batch_send_ts.elapsed();
-                            stats.batch_send_time_spent.fetch_add(send_duration.as_micros() as u64, Ordering::Relaxed);
+                            stats
+                                .batch_send_time_spent
+                                .fetch_add(send_duration.as_micros() as u64, Ordering::Relaxed);
                             stats.send_batch_count.fetch_add(1, Ordering::Relaxed);
-                            stats.send_batch_size_sum.fetch_add(next_batch_send.len() as u64, Ordering::Relaxed);
+                            stats
+                                .send_batch_size_sum
+                                .fetch_add(next_batch_send.len() as u64, Ordering::Relaxed);
                             observe_send_duration(send_duration.as_micros() as f64);
                             observe_send_packet_count(next_batch_send.len() as f64);
                         }
                         Err(SendPktsError::IoError(err, num_failed)) => {
                             error!(
-                                "Failed to send batch of size {}. \
-                                {num_failed} packets failed. Error: {err}",
+                                "Failed to send batch of size {}. {num_failed} packets failed. Error: {err}",
                                 next_batch_send.len()
                             );
                             inc_packets_forward_failed(num_failed as u64);
                         }
                     }
                 }
-                next_batch_send.clear();
 
-                // Recycle all used frames
+                // Recycle all used frames.
                 while let Some(desc) = recycled_frames.pop() {
                     fill_tx_vec[desc.shmem_idx]
                         .send(desc)
                         .expect("frame recycling");
+                }
+
+                if queued.is_empty() && next_batch_send.is_empty() && recycled_frames.is_empty() {
+                    std::thread::yield_now();
                 }
             }
             log::info!("Exiting pkt_fwd_tile {}", packet_fwd_idx);
@@ -391,8 +330,7 @@ pub fn run_proxy_system<R>(
     exit: Arc<AtomicBool>,
     pk_recv_stats: Arc<StreamerReceiveStats>,
     pk_fwd_stats: Arc<ShredMetrics>,
-    doublezero_v4_sk_vec: Vec<UdpSocket>,
-    doublezero_v6_sk_vec: Vec<UdpSocket>,
+    doublezero_sk_vec: Vec<UdpSocket>,
 ) where
     R: PacketRoutingStrategy + Send + Sync + 'static,
 {
@@ -402,17 +340,15 @@ pub fn run_proxy_system<R>(
     // Build pkt_recv sockets
     let pkt_recv_multicast_sk_vec = if let Some(multicast_config) = multticast_config {
         log::info!("Using Triton multicast configuration for pkt_recv tiles");
-        let vec = crate::triton_multicast_config::create_multicast_sockets_triton(
+        let vec = crate::multicast_config::create_multicast_sockets_triton(
             &multicast_config, 
-            NonZeroUsize::new(num_pkt_recv_tiles).expect("num_pkt_recv_tiles must be non-zero"),
         ).expect("multicast-config");
-        Some(vec)
+        Some(vec![vec])
     } else {
         None
     };
 
-    assert!(doublezero_v4_sk_vec.len() <= num_pkt_recv_tiles, "doublezero_v4_sk_vec.len() ({}) > num_pkt_recv_tiles ({})", doublezero_v4_sk_vec.len(), num_pkt_recv_tiles);
-    assert!(doublezero_v6_sk_vec.len() <= num_pkt_recv_tiles, "doublezero_v6_sk_vec.len() ({}) > num_pkt_recv_tiles ({})", doublezero_v6_sk_vec.len(), num_pkt_recv_tiles);
+    assert!(doublezero_sk_vec.len() <= num_pkt_recv_tiles, "doublezero_v4_sk_vec.len() ({}) > num_pkt_recv_tiles ({})", doublezero_sk_vec.len(), num_pkt_recv_tiles);
 
     let (_port, pkt_recv_sk_vec) = solana_net_utils::multi_bind_in_range_with_config(
         src_ip,
@@ -602,14 +538,10 @@ pub fn run_proxy_system<R>(
             recv_pkt_vec.push(multicast_sk_vec[pkt_recv_idx].try_clone().expect("multicast sk clone"));
         }
 
-        if let Some(doublezero_v4_sk) = doublezero_v4_sk_vec.get(pkt_recv_idx) {
+        if let Some(doublezero_v4_sk) = doublezero_sk_vec.get(pkt_recv_idx) {
             recv_pkt_vec.push(doublezero_v4_sk.try_clone().expect("doublezero v4 sk clone"));
         }
-
-        if let Some(doublezero_v6_sk) = doublezero_v6_sk_vec.get(pkt_recv_idx) {
-            recv_pkt_vec.push(doublezero_v6_sk.try_clone().expect("doublezero v6 sk clone"));
-        }
-
+        
         let exit = Arc::clone(&exit);
         let forwarder_stats = Arc::clone(&pk_recv_stats);
         let packet_tx_vec_clone = packet_tx_vec.clone();

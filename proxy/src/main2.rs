@@ -20,12 +20,12 @@ use tokio::runtime::Runtime;
 use tonic::Status;
 
 use crate::{
-    forwarder::ShredMetrics, recv_mmsg::FECSetRoutingStrategy, token_authenticator::BlockEngineConnectionError, triton_forwarder::PktRecvTileMemConfig, triton_multicast_config::{TritonMulticastConfig, TritonMulticastConfigV4, TritonMulticastConfigV6, create_multicast_socket_on_device, create_multicast_sockets_triton}
+    forwarder::ShredMetrics, multicast_config::{TritonMulticastConfig, TritonMulticastConfigV4, TritonMulticastConfigV6, create_multicast_socket_on_device}, recv_mmsg::FECSetRoutingStrategy, token_authenticator::BlockEngineConnectionError, triton_forwarder::PktRecvTileMemConfig
 };
 pub mod deshred;
 pub mod forwarder;
 pub mod heartbeat;
-pub mod triton_multicast_config;
+pub mod multicast_config;
 pub mod server;
 pub mod token_authenticator;
 pub mod prom;
@@ -151,7 +151,7 @@ struct CommonArgs {
     /// If not provided, defaults to 8002.
     /// NOTE: this port must match the port used by the triton multicast sender.
     #[arg(long, env)]
-    triton_multicast_port: Option<u16>,
+    triton_multicast_subscription_port: Option<u16>,
 
     /// Address to bind prometheus metrics server to. If not provided, prometheus server is disabled.
     #[arg(long, env)]
@@ -322,36 +322,40 @@ fn main() -> Result<(), ShredstreamProxyError> {
     let use_discovery_service =
         args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
 
-    let (doublezero_v4_sk_vec, doublezero_v6_sk_vec) = create_multicast_socket_on_device(
+    let maybe_dz_multicast_socket_vec = create_multicast_socket_on_device(
         &args.multicast_device,
         args.multicast_subscribe_port,
         args.multicast_bind_ip,
-        num_pkt_recv_tiles,
-    )?;
-
+    )
+    .inspect(|mcast_socket| info!("Multicast listeners found: {mcast_socket:?}."));
 
     let maybe_triton_multicast_config = match args.triton_multicast_group {
         Some(multicast_group) => {
-            log::info!("Using triton multicast group: {}", multicast_group);
+            let device_ifname = args.triton_multicast_bind_interface.clone().ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "'triton-multicast-bind-interface' is required if 'triton-multicast-group' is set",
+                )
+            })?;
+            let subscription_port = args.triton_multicast_subscription_port.ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "'triton-multicast-subscription-port' is required if 'triton-multicast-group' is set",
+                )
+            })?;
             match multicast_group {
                 IpAddr::V4(ipv4) => {
                     Some(TritonMulticastConfig::Ipv4(TritonMulticastConfigV4 {
                         multicast_ip: ipv4,
-                        bind_ifname: args.triton_multicast_bind_interface,
-                        listen_port: args.triton_multicast_port.unwrap_or(8002),
+                        device_ifname: device_ifname,
+                        subscription_port,
                     }))
                 }
                 IpAddr::V6(ipv6) => {
                     Some(TritonMulticastConfig::Ipv6(TritonMulticastConfigV6 {
                         multicast_ip: ipv6,
-                        device_ifname: args.triton_multicast_bind_interface
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    ErrorKind::InvalidInput,
-                                    "triton-multicast-bind-interface is required for IPv6",
-                                )
-                            })?,
-                        listen_port: args.triton_multicast_port.unwrap_or(8002),
+                        device_ifname: device_ifname,
+                        subscription_port,
                     }))
                 }
             }
@@ -384,8 +388,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
                 exit,
                 pkt_recv_stats,
                 pkt_fwd_stats,
-                doublezero_v4_sk_vec,
-                doublezero_v6_sk_vec,
+                maybe_dz_multicast_socket_vec.unwrap_or_default(),
             );
         })
         .expect("tritonProxyMain")
