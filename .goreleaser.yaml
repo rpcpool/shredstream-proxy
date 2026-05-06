@@ -17,6 +17,8 @@ builds:
       flags:
           - --release
           - --package=jito-shredstream-proxy
+      env:
+          - CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 archives:
     - id: jito-shredstream-proxy
