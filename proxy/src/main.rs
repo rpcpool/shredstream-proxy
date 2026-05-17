@@ -56,6 +56,10 @@ enum ProxySubcommands {
 
     /// Does not request shreds from Jito. Sends anything received on `src-bind-addr`:`src-bind-port` to all destinations.
     ForwardOnly(CommonArgs),
+
+    /// Requests shreds from Jito to be sent to a specific port without binding a socket or forwarding.
+    /// Only performs authentication and heartbeat. Useful when another process is listening on the destination port.
+    SubscribeOnly(SubscribeOnlyArgs),
 }
 
 #[derive(clap::Args, Clone, Debug)]
@@ -80,6 +84,36 @@ struct ShredstreamArgs {
 
     #[clap(flatten)]
     common_args: CommonArgs,
+}
+
+#[derive(clap::Args, Clone, Debug)]
+struct SubscribeOnlyArgs {
+    /// Address for Jito Block Engine.
+    /// See https://jito-labs.gitbook.io/mev/searcher-resources/block-engine#connection-details
+    #[arg(long, env)]
+    block_engine_url: String,
+
+    /// Manual override for auth service address. For internal use.
+    #[arg(long, env)]
+    auth_url: Option<String>,
+
+    /// Path to keypair file used to authenticate with the backend.
+    #[arg(long, env)]
+    auth_keypair: PathBuf,
+
+    /// Desired regions to receive heartbeats from.
+    /// Receives `n` different streams. Requires at least 1 region, comma separated.
+    #[arg(long, env, value_delimiter = ',', required(true))]
+    desired_regions: Vec<String>,
+
+    /// Port to tell Jito to send shreds to. This process will NOT listen on this port.
+    #[arg(long, env)]
+    dest_port: u16,
+
+    /// Public IP address to use.
+    /// Overrides value fetched from `ifconfig.me`.
+    #[arg(long, env)]
+    public_ip: Option<IpAddr>,
 }
 
 #[derive(clap::Args, Clone, Debug)]
@@ -221,10 +255,17 @@ fn main() -> Result<(), ShredstreamProxyError> {
     let all_args: Args = Args::parse();
 
     let shredstream_args = all_args.shredstream_args.clone();
+
+    // Handle SubscribeOnly mode separately - it only needs heartbeat
+    if let ProxySubcommands::SubscribeOnly(ref sub_args) = shredstream_args {
+        return run_subscribe_only_mode(sub_args.clone());
+    }
+
     // common args
     let args = match all_args.shredstream_args {
         ProxySubcommands::Shredstream(x) => x.common_args,
         ProxySubcommands::ForwardOnly(x) => x,
+        ProxySubcommands::SubscribeOnly(_) => unreachable!(),
     };
     set_host_id(hostname::get()?.into_string().unwrap());
     if (args.endpoint_discovery_url.is_none() && args.discovered_endpoints_port.is_some())
@@ -373,6 +414,68 @@ fn main() -> Result<(), ShredstreamProxyError> {
         metrics.agg_fail_forward_cumulative.load(Ordering::Relaxed),
         metrics.duplicate_cumulative.load(Ordering::Relaxed),
     );
+    Ok(())
+}
+
+fn run_subscribe_only_mode(args: SubscribeOnlyArgs) -> Result<(), ShredstreamProxyError> {
+    set_host_id(hostname::get()?.into_string().unwrap());
+
+    let exit = Arc::new(AtomicBool::new(false));
+    let (shutdown_sender, shutdown_receiver) =
+        shutdown_notifier(exit.clone()).expect("Failed to set up signal handler");
+    let panic_hook = panic::take_hook();
+    {
+        let exit = exit.clone();
+        panic::set_hook(Box::new(move |panic_info| {
+            exit.store(true, Ordering::SeqCst);
+            let _ = shutdown_sender.send(());
+            error!("exiting process");
+            sleep(Duration::from_secs(1));
+            panic_hook(panic_info);
+        }));
+    }
+
+    let runtime = Runtime::new()?;
+
+    if args.desired_regions.len() > 2 {
+        warn!(
+            "Too many regions requested, only regions: {:?} will be used",
+            &args.desired_regions[..2]
+        );
+    }
+
+    let auth_keypair = Arc::new(
+        read_keypair_file(Path::new(&args.auth_keypair)).unwrap_or_else(|e| {
+            panic!(
+                "Unable to parse keypair file. Ensure that file {:?} is readable. Error: {e}",
+                args.auth_keypair
+            )
+        }),
+    );
+
+    let public_ip = args.public_ip.unwrap_or_else(|| get_public_ip().unwrap());
+    let recv_socket = SocketAddr::new(public_ip, args.dest_port);
+
+    info!(
+        "Starting subscribe-only mode. Requesting shreds to be sent to {}",
+        recv_socket
+    );
+
+    let heartbeat_hdl = heartbeat::heartbeat_loop_subscribe_only(
+        args.block_engine_url.clone(),
+        args.auth_url.unwrap_or(args.block_engine_url),
+        auth_keypair,
+        args.desired_regions,
+        recv_socket,
+        runtime,
+        "shredstream_proxy_subscribe".to_string(),
+        shutdown_receiver,
+        exit,
+    );
+
+    heartbeat_hdl.join().expect("heartbeat thread panicked");
+
+    info!("Exiting subscribe-only mode.");
     Ok(())
 }
 
