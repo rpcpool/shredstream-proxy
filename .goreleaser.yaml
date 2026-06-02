@@ -8,6 +8,13 @@
 
 version: 2
 
+# Pinned so the GCS blob directory injected by Binaries-ci's
+# ci/goreleaser-patch.yaml ({{ .ProjectName }}/v{{ .Version }}) is always
+# shredstream-proxy/, independent of the build context. Without this,
+# build-release.yml resolves the project name to the CI repo (Binaries-ci)
+# when this config is fetched to build an older tag that predates this file.
+project_name: shredstream-proxy
+
 builds:
     - id: jito-shredstream-proxy
       builder: rust
