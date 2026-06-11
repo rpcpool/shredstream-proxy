@@ -17,6 +17,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use clap::{arg, Parser};
+use core_affinity::CoreId;
 use crossbeam_channel::{Receiver, RecvError, Sender};
 use log::*;
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -40,6 +41,7 @@ mod heartbeat;
 mod multicast_config;
 mod server;
 mod token_authenticator;
+mod prom;
 
 #[derive(Clone, Debug, Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -80,6 +82,52 @@ struct ShredstreamArgs {
 
     #[clap(flatten)]
     common_args: CommonArgs,
+}
+
+#[derive(Clone, Debug)]
+struct AffinityArg {
+    affinity: Vec<core_affinity::CoreId>,
+}
+
+impl FromStr for AffinityArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.trim() == "auto" {
+            return Ok(AffinityArg { affinity: core_affinity::get_core_ids().unwrap() });
+        }
+        let mut affinity = Vec::new();
+        for part in s.split(',') {
+            if let Some((start, end)) = part.split_once('-') {
+                // parse range
+                let start: usize = start
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("Invalid number: {}", start))?;
+                let end: usize = end
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("Invalid number: {}", end))?;
+                if start > end {
+                    return Err(format!("Invalid range: {}-{}", start, end));
+                }
+                affinity.extend(start..=end);
+            } else {
+                // single core
+                let core: usize = part
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("Invalid number: {}", part))?;
+                affinity.push(core);
+            }
+        }
+
+        // remove duplicates and sort
+        affinity.sort_unstable();
+        affinity.dedup();
+        let affinity = affinity.into_iter().map(|id| CoreId { id }).collect();
+        Ok(AffinityArg { affinity })
+    }
 }
 
 #[derive(clap::Args, Clone, Debug)]
@@ -144,6 +192,17 @@ struct CommonArgs {
     /// Number of threads to use. Defaults to use up to 4.
     #[arg(long, env)]
     num_threads: Option<usize>,
+
+    /// Affinity mask for sender threads. Comma separated list of core ids or ranges.
+    /// Example: `0,2,4-6` pins to cores 0, 2, 4, 5, and 6.
+    /// Use `auto` to pin to all available cores.
+    /// If not provided, threads are not pinned to any core.
+    #[arg(long, env)]
+    ssprxytx_affinity: Option<AffinityArg>,
+
+    /// Address to bind prometheus metrics server to. If not provided, prometheus server is disabled.
+    #[arg(long, env)]
+    prometheus_bind_addr: Option<SocketAddr>,
 }
 
 #[derive(Debug, Error)]
@@ -217,7 +276,8 @@ fn shutdown_notifier(exit: Arc<AtomicBool>) -> io::Result<(Sender<()>, Receiver<
 pub type ReconstructedShredsMap = HashMap<Slot, HashMap<u32 /* fec_set_index */, Vec<Shred>>>;
 fn main() -> Result<(), ShredstreamProxyError> {
     env_logger::builder().init();
-
+    let prom_registry  = prometheus::Registry::new();
+    prom::register_metrics(&prom_registry);
     let all_args: Args = Args::parse();
 
     let shredstream_args = all_args.shredstream_args.clone();
@@ -256,6 +316,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
     }
 
     let metrics = Arc::new(ShredMetrics::new(args.grpc_service_port.is_some()));
+    
 
     let runtime = Runtime::new()?;
     let mut thread_handles = vec![];
@@ -309,6 +370,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         use_discovery_service,
         forward_stats.clone(),
         metrics.clone(),
+        args.ssprxytx_affinity.map(|a| a.affinity),
         shutdown_receiver.clone(),
         exit.clone(),
     );
@@ -355,10 +417,21 @@ fn main() -> Result<(), ShredstreamProxyError> {
         thread_handles.push(server_hdl);
     }
 
+    if let Some(prom_bind_addr) = args.prometheus_bind_addr {
+        let prom_hdl = prom::spawn_prometheus_server(
+            prom_bind_addr, 
+            prom_registry, 
+            shutdown_receiver.clone()
+        );
+        thread_handles.push(prom_hdl);
+    }
+
     info!(
         "Shredstream started, listening on {}:{}/udp.",
         args.src_bind_addr, args.src_bind_port
     );
+
+    
 
     for thread in thread_handles {
         thread.join().expect("thread panicked");
