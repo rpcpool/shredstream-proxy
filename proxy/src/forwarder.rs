@@ -33,15 +33,13 @@ use solana_streamer::{
 use tokio::sync::broadcast::Sender;
 
 use crate::{
-    ShredstreamProxyError,
     deshred::{self, ComparableShred, ShredsStateTracker},
     prom::{
-        observe_dedup_time, observe_send_packet_count, observe_send_duration,
-        observe_recv_interval, observe_recv_packet_count,
-        inc_packets_received, inc_packets_deduped, inc_packets_forwarded,
-        inc_packets_forward_failed, inc_packets_by_source,
+        inc_packets_by_source, inc_packets_deduped, inc_packets_forward_failed,
+        inc_packets_forwarded, inc_packets_received, observe_dedup_time, observe_recv_interval,
+        observe_recv_packet_count, observe_send_duration, observe_send_packet_count,
     },
-    resolve_hostname_port,
+    resolve_hostname_port, ShredstreamProxyError,
 };
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
@@ -238,9 +236,7 @@ fn recv_from_channel_and_send_multiple_dest(
     let packet_batch = maybe_packet_batch.map_err(ShredstreamProxyError::RecvError)?;
     let trace_shred_received_time = SystemTime::now();
     let batch_len = packet_batch.len() as u64;
-    metrics
-        .received
-        .fetch_add(batch_len, Ordering::Relaxed);
+    metrics.received.fetch_add(batch_len, Ordering::Relaxed);
     inc_packets_received(batch_len);
     observe_recv_packet_count(batch_len as f64);
     debug!(
@@ -261,7 +257,9 @@ fn recv_from_channel_and_send_multiple_dest(
         &mut packet_batch_vec,
     );
     let t_dedup_usecs = t.elapsed().as_micros() as u64;
-    metrics.dedup_time_spent.fetch_add(t_dedup_usecs, Ordering::Relaxed);
+    metrics
+        .dedup_time_spent
+        .fetch_add(t_dedup_usecs, Ordering::Relaxed);
     observe_dedup_time(t_dedup_usecs as f64);
     inc_packets_deduped(num_deduped);
 
@@ -277,10 +275,12 @@ fn recv_from_channel_and_send_multiple_dest(
                     *discarded += is_discarded as u64;
                     *not_discarded += (!is_discarded) as u64;
                 })
-                .or_insert_with(|| {
-                    (is_discarded as u64, (!is_discarded) as u64)
-                });
-            let status = if is_discarded { "discarded" } else { "forwarded" };
+                .or_insert_with(|| (is_discarded as u64, (!is_discarded) as u64));
+            let status = if is_discarded {
+                "discarded"
+            } else {
+                "forwarded"
+            };
             inc_packets_by_source(&addr.to_string(), status, 1);
         });
     });
@@ -301,10 +301,14 @@ fn recv_from_channel_and_send_multiple_dest(
             .fetch_add(packets_with_dest.len() as u64, Ordering::Relaxed);
         metrics.send_batch_count.fetch_add(1, Ordering::Relaxed);
         const MAX_IOV: usize = libc::UIO_MAXIOV as usize;
-        let max_iov_count  = packets_with_dest.len() / MAX_IOV;
+        let max_iov_count = packets_with_dest.len() / MAX_IOV;
         let unsaturated_iov_count = packets_with_dest.len() % MAX_IOV;
-        metrics.saturated_iov_count.fetch_add(max_iov_count as u64, Ordering::Relaxed);
-        metrics.unsaturated_iov_count.fetch_add(unsaturated_iov_count as u64, Ordering::Relaxed);
+        metrics
+            .saturated_iov_count
+            .fetch_add(max_iov_count as u64, Ordering::Relaxed);
+        metrics
+            .unsaturated_iov_count
+            .fetch_add(unsaturated_iov_count as u64, Ordering::Relaxed);
         observe_send_packet_count(packets_with_dest.len() as f64);
         match batch_send(send_socket, &packets_with_dest) {
             Ok(_) => {
@@ -330,7 +334,9 @@ fn recv_from_channel_and_send_multiple_dest(
             }
         }
         let t_send_usecs = t.elapsed().as_micros() as u64;
-        metrics.batch_send_time_spent.fetch_add(t_send_usecs, Ordering::Relaxed);
+        metrics
+            .batch_send_time_spent
+            .fetch_add(t_send_usecs, Ordering::Relaxed);
         observe_send_duration(t_send_usecs as f64);
     });
 
@@ -588,7 +594,11 @@ impl ShredMetrics {
 
         datapoint_info!(
             "shredstream_proxy-sendmmsg_iov_metrics",
-            ("max_iov_count", self.saturated_iov_count.load(Ordering::Relaxed), i64),
+            (
+                "max_iov_count",
+                self.saturated_iov_count.load(Ordering::Relaxed),
+                i64
+            ),
             (
                 "unsaturated_iov_count",
                 self.unsaturated_iov_count.load(Ordering::Relaxed),
@@ -597,12 +607,16 @@ impl ShredMetrics {
         );
 
         datapoint_info!(
-            "shredstream_proxy-batch_send_metrics", 
+            "shredstream_proxy-batch_send_metrics",
             (
-                "send_batch_size_sum", self.send_batch_size_sum.load(Ordering::Relaxed), i64
+                "send_batch_size_sum",
+                self.send_batch_size_sum.load(Ordering::Relaxed),
+                i64
             ),
             (
-                "send_batch_count", self.send_batch_count.load(Ordering::Relaxed), i64
+                "send_batch_count",
+                self.send_batch_count.load(Ordering::Relaxed),
+                i64
             )
         );
 
@@ -619,7 +633,6 @@ impl ShredMetrics {
                 i64
             ),
         );
-
 
         if self.enabled_grpc_service {
             datapoint_info!(

@@ -38,9 +38,9 @@ mod deshred;
 pub mod forwarder;
 mod heartbeat;
 mod multicast_config;
+mod prom;
 mod server;
 mod token_authenticator;
-mod prom;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -263,7 +263,7 @@ fn shutdown_notifier(exit: Arc<AtomicBool>) -> io::Result<(Sender<()>, Receiver<
 pub type ReconstructedShredsMap = HashMap<Slot, HashMap<u32 /* fec_set_index */, Vec<Shred>>>;
 fn main() -> Result<(), ShredstreamProxyError> {
     env_logger::builder().init();
-    let prom_registry  = prometheus::Registry::new();
+    let prom_registry = prometheus::Registry::new();
     prom::register_metrics(&prom_registry);
     let all_args: Args = Args::parse();
 
@@ -310,7 +310,6 @@ fn main() -> Result<(), ShredstreamProxyError> {
     }
 
     let metrics = Arc::new(ShredMetrics::new(args.grpc_service_port.is_some()));
-    
 
     let runtime = Runtime::new()?;
     let mut thread_handles = vec![];
@@ -411,11 +410,8 @@ fn main() -> Result<(), ShredstreamProxyError> {
     }
 
     if let Some(prom_bind_addr) = args.prometheus_bind_addr {
-        let prom_hdl = prom::spawn_prometheus_server(
-            prom_bind_addr, 
-            prom_registry, 
-            shutdown_receiver.clone()
-        );
+        let prom_hdl =
+            prom::spawn_prometheus_server(prom_bind_addr, prom_registry, shutdown_receiver.clone());
         thread_handles.push(prom_hdl);
     }
 
@@ -423,8 +419,6 @@ fn main() -> Result<(), ShredstreamProxyError> {
         "Shredstream started, listening on {}:{}/udp.",
         args.src_bind_addr, args.src_bind_port
     );
-
-    
 
     for thread in thread_handles {
         thread.join().expect("thread panicked");

@@ -88,22 +88,43 @@ pub fn inc_packets_forward_failed(count: u64) {
 }
 
 pub fn inc_packets_by_source(addr: &str, status: &str, count: u64) {
-    PACKETS_BY_SOURCE.with_label_values(&[addr, status]).inc_by(count);
+    PACKETS_BY_SOURCE
+        .with_label_values(&[addr, status])
+        .inc_by(count);
 }
 
 pub fn register_metrics(registry: &prometheus::Registry) {
-    registry.register(Box::new(DEDUP_DURATION_HIST.clone())).unwrap();
-    registry.register(Box::new(SEND_DURATION_HIST.clone())).unwrap();
-    registry.register(Box::new(SEND_PACKET_COUNT_HIST.clone())).unwrap();
-    registry.register(Box::new(RECV_INTERVAL_HIST.clone())).unwrap();
-    registry.register(Box::new(RECV_PACKET_COUNT_HIST.clone())).unwrap();
-    registry.register(Box::new(PACKETS_RECEIVED_TOTAL.clone())).unwrap();
-    registry.register(Box::new(PACKETS_DEDUPED_TOTAL.clone())).unwrap();
-    registry.register(Box::new(PACKETS_FORWARDED_TOTAL.clone())).unwrap();
-    registry.register(Box::new(PACKETS_FORWARD_FAILED_TOTAL.clone())).unwrap();
-    registry.register(Box::new(PACKETS_BY_SOURCE.clone())).unwrap();
+    registry
+        .register(Box::new(DEDUP_DURATION_HIST.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(SEND_DURATION_HIST.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(SEND_PACKET_COUNT_HIST.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(RECV_INTERVAL_HIST.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(RECV_PACKET_COUNT_HIST.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(PACKETS_RECEIVED_TOTAL.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(PACKETS_DEDUPED_TOTAL.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(PACKETS_FORWARDED_TOTAL.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(PACKETS_FORWARD_FAILED_TOTAL.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(PACKETS_BY_SOURCE.clone()))
+        .unwrap();
 }
-
 
 pub fn spawn_prometheus_server(
     bind_addr: SocketAddr,
@@ -121,8 +142,7 @@ pub fn spawn_prometheus_server(
                     break;
                 }
                 // handle each request in a separate thread to avoid blocking
-                let result = server
-                    .recv_timeout(Duration::from_secs(1));
+                let result = server.recv_timeout(Duration::from_secs(1));
                 let maybe = match result {
                     Ok(r) => r,
                     Err(e) => {
