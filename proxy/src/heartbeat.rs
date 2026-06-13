@@ -196,6 +196,119 @@ pub fn heartbeat_loop_thread(
     }).unwrap()
 }
 
+/// Simplified heartbeat loop that only performs authentication and sends heartbeats.
+/// Does not check for received shreds or track metrics. Used for subscribe-only mode.
+#[allow(clippy::too_many_arguments)]
+pub fn heartbeat_loop_subscribe_only(
+    block_engine_url: String,
+    auth_url: String,
+    auth_keypair: Arc<Keypair>,
+    desired_regions: Vec<String>,
+    recv_socket: SocketAddr,
+    runtime: Runtime,
+    service_name: String,
+    shutdown_receiver: Receiver<()>,
+    exit: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    Builder::new()
+        .name("ssPxyHbeatSub".to_string())
+        .spawn(move || {
+            let heartbeat_socket = jito_protos::shared::Socket {
+                ip: recv_socket.ip().to_string(),
+                port: recv_socket.port() as i64,
+            };
+            let mut heartbeat_interval = Duration::from_secs(1);
+            let mut heartbeat_tick = crossbeam_channel::tick(heartbeat_interval);
+            let mut client_restart_count_cumulative = 0u64;
+            let mut successful_heartbeat_count_cumulative = 0u64;
+            let mut failed_heartbeat_count_cumulative = 0u64;
+
+            while !exit.load(Ordering::Relaxed) {
+                let per_con_exit = ScopedAtomicBool::default();
+                info!("Starting heartbeat client (subscribe-only mode)");
+                let shredstream_client_res = runtime.block_on(get_grpc_client(
+                    block_engine_url.clone(),
+                    auth_url.clone(),
+                    auth_keypair.clone(),
+                    service_name.clone(),
+                    per_con_exit.get_inner_clone(),
+                ));
+
+                let (mut shredstream_client, _refresh_thread_hdl) = match shredstream_client_res {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("Failed to connect to block engine, retrying. Error: {e}");
+                        client_restart_count_cumulative += 1;
+                        datapoint_warn!(
+                            "shredstream_proxy-heartbeat_client_error",
+                            "block_engine_url" => block_engine_url,
+                            ("errors", 1, i64),
+                            ("error_str", e.to_string(), String),
+                        );
+                        sleep(Duration::from_secs(5));
+                        continue;
+                    }
+                };
+
+                let mut successful_heartbeat_count = 0u64;
+                let mut failed_heartbeat_count = 0u64;
+
+                while !exit.load(Ordering::Relaxed) {
+                    crossbeam_channel::select! {
+                        recv(heartbeat_tick) -> _ => {
+                            let heartbeat_result = runtime.block_on(
+                                shredstream_client.send_heartbeat(Heartbeat {
+                                    socket: Some(heartbeat_socket.clone()),
+                                    regions: desired_regions.clone(),
+                                })
+                            );
+
+                            match heartbeat_result {
+                                Ok(hb) => {
+                                    let new_interval =
+                                        Duration::from_millis((hb.get_ref().ttl_ms / 3) as u64);
+                                    if heartbeat_interval != new_interval {
+                                        info!("Sending heartbeat every {new_interval:?}.");
+                                        heartbeat_interval = new_interval;
+                                        heartbeat_tick = crossbeam_channel::tick(new_interval);
+                                    }
+                                    successful_heartbeat_count += 1;
+                                }
+                                Err(err) => {
+                                    if err.code() == Code::InvalidArgument {
+                                        panic!("Invalid arguments: {err}.");
+                                    };
+                                    warn!("Error sending heartbeat: {err}");
+                                    failed_heartbeat_count += 1;
+                                    // Restart client on repeated failures
+                                    if failed_heartbeat_count > 5 {
+                                        warn!("Too many heartbeat failures, restarting client.");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        recv(shutdown_receiver) -> _ => {
+                            break;
+                        }
+                    }
+                }
+
+                successful_heartbeat_count_cumulative += successful_heartbeat_count;
+                failed_heartbeat_count_cumulative += failed_heartbeat_count;
+            }
+
+            info!(
+                "Exiting heartbeat thread (subscribe-only), sent {} successful, {} failed heartbeats. Client restarted {} times.",
+                successful_heartbeat_count_cumulative,
+                failed_heartbeat_count_cumulative,
+                client_restart_count_cumulative
+            );
+        })
+        .unwrap()
+}
+
 pub async fn get_grpc_client(
     block_engine_url: String,
     auth_url: String,
