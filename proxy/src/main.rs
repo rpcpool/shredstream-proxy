@@ -187,6 +187,13 @@ struct CommonArgs {
     #[arg(long, env)]
     num_threads: Option<usize>,
 
+    /// Time in milliseconds to coalesce incoming packets into a batch before forwarding.
+    /// `0` (default) forwards each batch as soon as it is received for lowest latency.
+    /// A higher value waits up to this long to build larger batches, reducing CPU usage
+    /// at the cost of added latency.
+    #[arg(long, env, default_value_t = 0)]
+    coalesce_ms: u64,
+
     /// Address to bind prometheus metrics server to. If not provided, prometheus server is disabled.
     #[arg(long, env)]
     prometheus_bind_addr: Option<SocketAddr>,
@@ -356,6 +363,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         args.src_bind_port,
         maybe_multicast_socket,
         args.num_threads,
+        Duration::from_millis(args.coalesce_ms),
         deduper.clone(),
         args.grpc_service_port.is_some(),
         entry_sender.clone(),
